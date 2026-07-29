@@ -1,0 +1,39 @@
+external_components:
+  - source:
+      type: git
+      url: https://github.com/brianj74/nemtekmerlin4
+    components: [nemtek]
+
+uart:
+  id: nemtek_uart
+  rx_pin:
+    number: GPIO21
+    inverted: true
+  baud_rate: 2400
+  data_bits: 8
+  parity: EVEN
+  stop_bits: 1
+
+nemtek:
+  uart_id: nemtek_uart
+  binary_sensor:
+    communications:
+      name: "Nemtek Communications"
+    fence_off:
+      name: "Nemtek Fence Off"
+    fence_low_power:
+      name: "Nemtek Low Power"
+    fence_volts_low:
+      name: "Nemtek Voltage Low"
+    fence_alarm_volts:
+      name: "Nemtek Alarm Voltage"
+    alarm_active:
+      name: "Nemtek Alarm"
+    hv_good:
+      name: "Nemtek HV Good"
+    hv_check:
+      name: "Nemtek HV Check"
+    hv_bad:
+      name: "Nemtek HV Bad"
+    buzzer_active:
+      name: "Nemtek Buzzer"
