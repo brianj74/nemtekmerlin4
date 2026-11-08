@@ -5,6 +5,9 @@ Experimental, receive-only ESPHome integration for monitoring a **Nemtek Merlin 
 > [!WARNING]
 > This project is based on reverse engineering and has not been endorsed by Nemtek. It is intended for monitoring only. Do not rely on it as the sole alarm or safety system.
 
+> [!WARNING]
+> Optional bus capture logs raw keypad bytes. A PIN entry will be in that log. Keep logs private and redact them before sharing. See [docs/capture.md](docs/capture.md).
+
 ## What it currently exposes
 
 - Communications healthy
@@ -36,15 +39,24 @@ The data signal is read as an **inverted 2400-baud, 8E1 UART**.
 
 See [docs/wiring.md](docs/wiring.md) before connecting anything.
 
+## Bus capture
+
+An optional Home Assistant switch, **Nemtek Capture**, logs every received burst with per-byte microsecond gaps. A text entity, **Nemtek Capture Mark**, writes `MARK: <label>` into that log. Decoding keeps running while capture is on. The UART is still receive-only.
+
+How to OTA-flash this branch, run a keypad checklist, and redact a log: [docs/capture.md](docs/capture.md).
+
 ## Installation
+
+Dashboard OTA using this branch is documented in [docs/capture.md](docs/capture.md). The example YAML is [examples/nemtek-merlin.yaml](examples/nemtek-merlin.yaml). Sensor keys belong directly under `nemtek:`.
 
 ### Local ESPHome component
 
 1. Copy `components/nemtek` into the directory containing your ESPHome YAML.
 2. Copy `examples/nemtek-merlin.yaml` alongside the `components` directory.
-3. Add the required secrets to `secrets.yaml`.
-4. Run **Clean Build Files** for the first build.
-5. Validate, compile and flash the ESP32.
+3. In that copy, point `external_components` at the local folder (`type: local`, `path: components`) if you are not using the git `ref`.
+4. Add the required secrets to `secrets.yaml` (`wifi_ssid`, `wifi_password`, `api_encryption_key`, `ota_password`).
+5. Run **Clean Build Files** for the first build.
+6. Validate, compile and flash the ESP32.
 
 Expected layout:
 
@@ -71,7 +83,9 @@ The current empirical mapping and known uncertainties are documented in [docs/pr
 
 ## Contributing captures
 
-Useful captures include a stable baseline followed by one controlled state change, such as:
+Use [docs/capture.md](docs/capture.md). Record idle traffic, then one labelled action at a time. Redact PIN bytes before sending the log.
+
+Useful follow-up captures, after the key checklist, are a stable baseline and one state change:
 
 - High power to low power
 - Healthy fence to loaded/shorted fence
@@ -79,7 +93,7 @@ Useful captures include a stable baseline followed by one controlled state chang
 - Fence on to fence off
 - Ordinary keypad beep without an alarm
 
-Please include the energiser model, the action performed and the ESPHome log section before/during/after the change.
+Include the energiser model, the action performed, and the log section before, during, and after the change.
 
 ## Licence
 

@@ -2,13 +2,41 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
+#include <vector>
 
 #include "esphome/components/binary_sensor/binary_sensor.h"
+#include "esphome/components/switch/switch.h"
+#include "esphome/components/text/text.h"
 #include "esphome/components/uart/uart.h"
 #include "esphome/core/component.h"
 
 namespace esphome {
 namespace nemtek {
+
+class NemtekComponent;
+
+// Home Assistant switch. Boot default is off (restore_mode ALWAYS_OFF).
+class NemtekCaptureSwitch : public switch_::Switch {
+ public:
+  void set_parent(NemtekComponent *parent) { this->parent_ = parent; }
+
+ protected:
+  void write_state(bool state) override;
+
+  NemtekComponent *parent_{nullptr};
+};
+
+// Setting this text from Home Assistant inserts one "MARK: <label>" log line.
+class NemtekMarkText : public text::Text {
+ public:
+  void set_parent(NemtekComponent *parent) { this->parent_ = parent; }
+
+ protected:
+  void control(const std::string &value) override;
+
+  NemtekComponent *parent_{nullptr};
+};
 
 class NemtekComponent : public Component, public uart::UARTDevice {
  public:
@@ -16,6 +44,15 @@ class NemtekComponent : public Component, public uart::UARTDevice {
   void loop() override;
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::DATA; }
+
+  void set_capture_switch(NemtekCaptureSwitch *capture_switch) { this->capture_switch_ = capture_switch; }
+  void set_mark_text(NemtekMarkText *mark_text) { this->mark_text_ = mark_text; }
+  void set_capture_coalesce(bool coalesce) { this->capture_coalesce_ = coalesce; }
+
+  // Runtime toggle used by the capture switch. Starts off.
+  void set_capture_enabled(bool enabled);
+  // Insert a capture annotation. Empty labels are ignored.
+  void mark(const std::string &label);
 
 #define NEMTEK_SETTER(name) \
   void set_##name##_sensor(binary_sensor::BinarySensor *sensor) { this->name##_sensor_ = sensor; }
@@ -44,6 +81,14 @@ class NemtekComponent : public Component, public uart::UARTDevice {
 #undef NEMTEK_SETTER
 
  protected:
+  // Receive-only phase. These hide UARTDevice's write path so this component
+  // cannot drive the keypad DAT line. A later transmit phase has to remove them.
+  void write_byte(uint8_t data) = delete;
+  void write_array(const uint8_t *data, size_t len) = delete;
+  void write_array(const std::vector<uint8_t> &data) = delete;
+  void write_str(const char *str) = delete;
+  size_t write(uint8_t data) = delete;
+
   enum class MerlinState : uint8_t {
     UNKNOWN = 0,
     NORMAL,
@@ -53,23 +98,77 @@ class NemtekComponent : public Component, public uart::UARTDevice {
     OFF,
   };
 
+  void prepare_uart_();
+  void ingest_(uint8_t byte, uint32_t now_us);
+  void finish_burst_();
+  bool classify_(MerlinState *state, bool *eb_present) const;
   void decode_burst_();
   void consider_state_(MerlinState state, bool eb_present);
   void publish_state_(MerlinState state, bool eb_present);
   void publish_(binary_sensor::BinarySensor *sensor, bool state);
+  void invalidate_(binary_sensor::BinarySensor *sensor);
+  void lose_comms_();
   void set_comms_(bool state);
   const char *state_name_(MerlinState state) const;
+  const char *map_token_(MerlinState state) const;
 
-  std::array<uint8_t, 32> burst_{};
+  void log_capture_();
+  void log_capture_full_(const char *map_name);
+  void log_repeat_(uint32_t extra_count);
+  void flush_pending_repeats_(uint32_t now_ms);
+  void save_pattern_();
+  void note_repeat_gap_();
+  bool same_pattern_() const;
+  bool timing_differs_() const;
+  uint8_t take_error_flags_();
+  void sync_error_counters_();
+
+  static constexpr size_t kBurstMax = 48;
+
+  std::array<uint8_t, kBurstMax> burst_{};
+  std::array<uint32_t, kBurstMax> delta_us_{};
+  std::array<uint8_t, kBurstMax> flags_{};
   size_t burst_len_{0};
-  uint32_t last_rx_ms_{0};
+  uint16_t burst_dropped_{0};
+  uint32_t burst_parity_{0};
+  uint32_t burst_frame_{0};
+  uint32_t burst_overflow_{0};
+  uint32_t burst_start_us_{0};
+  uint32_t burst_gap_us_{0};
+  uint32_t last_rx_us_{0};
+  bool have_rx_{false};
+
+  std::array<uint8_t, kBurstMax> last_bytes_{};
+  std::array<uint32_t, kBurstMax> last_delta_us_{};
+  std::array<uint8_t, kBurstMax> last_flags_{};
+  size_t last_len_{0};
+  uint16_t last_dropped_{0};
+  uint32_t last_parity_{0};
+  uint32_t last_frame_{0};
+  uint32_t last_overflow_{0};
+  uint32_t repeat_count_{0};
+  uint32_t repeat_gap_min_us_{0};
+  uint32_t repeat_gap_max_us_{0};
+  uint32_t last_repeat_log_ms_{0};
+
+  uint32_t parity_seen_{0};
+  uint32_t frame_seen_{0};
+  uint32_t overflow_seen_{0};
+  bool error_hook_ok_{false};
+  bool uart_prepared_{false};
+
   uint32_t last_valid_ms_{0};
   bool comms_state_{false};
+  bool capture_enabled_{false};
+  bool capture_coalesce_{true};
 
   MerlinState current_state_{MerlinState::UNKNOWN};
   MerlinState candidate_state_{MerlinState::UNKNOWN};
   uint8_t candidate_count_{0};
   bool current_eb_{false};
+
+  NemtekCaptureSwitch *capture_switch_{nullptr};
+  NemtekMarkText *mark_text_{nullptr};
 
 #define NEMTEK_SENSOR(name) binary_sensor::BinarySensor *name##_sensor_{nullptr};
   NEMTEK_SENSOR(hv_good)

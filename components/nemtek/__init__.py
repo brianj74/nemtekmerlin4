@@ -1,15 +1,19 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import binary_sensor, uart
+from esphome.components import binary_sensor, switch, text, uart
 from esphome.const import CONF_ID
 
 DEPENDENCIES = ["uart"]
-AUTO_LOAD = ["binary_sensor"]
+AUTO_LOAD = ["binary_sensor", "switch", "text"]
 
 nemtek_ns = cg.esphome_ns.namespace("nemtek")
-NemtekComponent = nemtek_ns.class_(
-    "NemtekComponent", cg.Component, uart.UARTDevice
-)
+NemtekComponent = nemtek_ns.class_("NemtekComponent", cg.Component, uart.UARTDevice)
+NemtekCaptureSwitch = nemtek_ns.class_("NemtekCaptureSwitch", switch.Switch)
+NemtekMarkText = nemtek_ns.class_("NemtekMarkText", text.Text)
+
+CONF_CAPTURE = "capture"
+CONF_MARK = "mark"
+CONF_CAPTURE_COALESCE = "capture_coalesce"
 
 SENSORS = {
     "hv_good": ("set_hv_good_sensor", "running"),
@@ -42,10 +46,26 @@ for key, (_, device_class) in SENSORS.items():
         options["device_class"] = device_class
     schema[cv.Optional(key)] = binary_sensor.binary_sensor_schema(**options)
 
+schema[cv.Optional(CONF_CAPTURE)] = switch.switch_schema(
+    NemtekCaptureSwitch,
+    icon="mdi:record-circle-outline",
+    entity_category="config",
+    default_restore_mode="ALWAYS_OFF",
+)
+schema[cv.Optional(CONF_MARK)] = text.text_schema(
+    NemtekMarkText,
+    icon="mdi:marker-check",
+    entity_category="config",
+    mode="TEXT",
+)
+schema[cv.Optional(CONF_CAPTURE_COALESCE, default=True)] = cv.boolean
+schema[cv.Optional("binary_sensor")] = cv.invalid(
+    "Put each sensor directly under 'nemtek:'. "
+    'Example: nemtek -> communications -> name: "Nemtek Communications"'
+)
+
 CONFIG_SCHEMA = (
-    cv.Schema(schema)
-    .extend(uart.UART_DEVICE_SCHEMA)
-    .extend(cv.COMPONENT_SCHEMA)
+    cv.Schema(schema).extend(uart.UART_DEVICE_SCHEMA).extend(cv.COMPONENT_SCHEMA)
 )
 
 
@@ -53,8 +73,21 @@ async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
     await uart.register_uart_device(var, config)
+    cg.add(var.set_capture_coalesce(config[CONF_CAPTURE_COALESCE]))
 
     for key, (setter, _) in SENSORS.items():
         if key in config:
             sensor = await binary_sensor.new_binary_sensor(config[key])
             cg.add(getattr(var, setter)(sensor))
+
+    if CONF_CAPTURE in config:
+        capture = await switch.new_switch(config[CONF_CAPTURE])
+        cg.add(capture.set_parent(var))
+        cg.add(var.set_capture_switch(capture))
+
+    if CONF_MARK in config:
+        mark = await text.new_text(
+            config[CONF_MARK], min_length=0, max_length=48
+        )
+        cg.add(mark.set_parent(var))
+        cg.add(var.set_mark_text(mark))
