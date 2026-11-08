@@ -53,10 +53,6 @@ uart:
   parity: EVEN
   stop_bits: 1
   rx_buffer_size: 256
-  # One byte makes each byte visible to the capture timestamps.
-  # The component also sets these in setup.
-  rx_full_threshold: 1
-  rx_timeout: 1
 
 nemtek:
   uart_id: nemtek_uart

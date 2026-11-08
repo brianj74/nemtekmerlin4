@@ -6,14 +6,6 @@
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 
-#ifdef USE_ESP32
-#include <driver/uart.h>
-
-#include "esphome/components/uart/uart_component_esp_idf.h"
-#include "esphome/core/application.h"
-#include "hal/uart_ll.h"
-#endif
-
 namespace esphome {
 namespace nemtek {
 
@@ -27,41 +19,6 @@ static constexpr uint32_t TIMING_MATCH_US = 2000;
 static constexpr uint32_t BATCHED_DELTA_US = 250;
 static constexpr uint8_t REQUIRED_MATCHES = 3;
 static constexpr int MAX_BYTES_PER_LOOP = 64;
-
-static constexpr uint8_t FLAG_PARITY = 0x01;
-static constexpr uint8_t FLAG_FRAME = 0x02;
-static constexpr uint8_t FLAG_OVERFLOW = 0x04;
-
-// ESP-IDF UART int_st bits (TRM): bit2 parity, bit3 framing, bit4 RX FIFO overflow.
-// The hardware does not store these flags beside the FIFO byte. The driver's ISR
-// reports them on the select callback just before it clears the status, so the flag
-// is attached to the next byte read on the main loop. Treat that link as best-effort;
-// the P/F/O totals on the CAP header are the exact counts.
-static constexpr uint32_t UART_STATUS_PARITY = 1u << 2;
-static constexpr uint32_t UART_STATUS_FRAME = 1u << 3;
-static constexpr uint32_t UART_STATUS_OVERFLOW = 1u << 4;
-
-static volatile uint32_t g_parity_errors = 0;
-static volatile uint32_t g_frame_errors = 0;
-static volatile uint32_t g_overflow_errors = 0;
-
-#ifdef USE_ESP32
-static void IRAM_ATTR nemtek_uart_notif(uart_port_t uart_num, uart_select_notif_t notif, BaseType_t *task_woken) {
-  if (notif == UART_SELECT_ERROR_NOTIF) {
-    const uint32_t status = uart_ll_get_intsts_mask(UART_LL_GET_HW(uart_num));
-    if ((status & UART_STATUS_PARITY) != 0)
-      g_parity_errors++;
-    if ((status & UART_STATUS_FRAME) != 0)
-      g_frame_errors++;
-    if ((status & UART_STATUS_OVERFLOW) != 0)
-      g_overflow_errors++;
-  }
-  // ESPHome's wake-on-RX callback is a single function pointer. This hook replaces
-  // it and has to keep waking the loop, or bytes sit in the driver for a select timeout.
-  if ((notif == UART_SELECT_READ_NOTIF || notif == UART_SELECT_ERROR_NOTIF) && task_woken != nullptr)
-    esphome::Application::wake_loop_isrsafe(task_woken);
-}
-#endif
 
 void NemtekCaptureSwitch::write_state(bool state) {
   if (this->parent_ != nullptr)
@@ -81,13 +38,11 @@ void NemtekComponent::setup() {
   ESP_LOGI(TAG, "Capture logs can contain keypad PIN digits. Keep them private.");
   this->burst_len_ = 0;
   this->set_comms_(false);
-  this->prepare_uart_();
 
   while (this->available()) {
     uint8_t discard;
     this->read_byte(&discard);
   }
-  this->sync_error_counters_();
 
   if (this->capture_switch_ != nullptr) {
     auto initial = this->capture_switch_->get_initial_state_with_restore_mode();
@@ -97,37 +52,6 @@ void NemtekComponent::setup() {
   }
   if (this->mark_text_ != nullptr)
     this->mark_text_->publish_state("");
-}
-
-void NemtekComponent::prepare_uart_() {
-  if (this->uart_prepared_)
-    return;
-  this->uart_prepared_ = true;
-  if (this->parent_ == nullptr)
-    return;
-
-  // One-byte RX threshold so each byte is released as it arrives. At 2400 baud
-  // that is an interrupt about every 4.6 ms, which the loop can drain.
-  this->set_rx_full_threshold(1);
-  this->set_rx_timeout(1);
-  ESP_LOGI(TAG, "UART RX full threshold %u byte(s), RX timeout %u",
-           static_cast<unsigned>(this->get_rx_full_threshold()),
-           static_cast<unsigned>(this->get_rx_timeout()));
-
-#ifdef USE_ESP32
-  auto *idf = static_cast<uart::IDFUARTComponent *>(this->parent_);
-  const uart_port_t port = static_cast<uart_port_t>(idf->get_hw_serial_number());
-  if (port >= UART_NUM_MAX || !uart_is_driver_installed(port)) {
-    ESP_LOGW(TAG, "Parity/framing flags unavailable (hardware UART driver not ready)");
-    return;
-  }
-  uart_set_select_notif_callback(port, nemtek_uart_notif);
-  this->error_hook_ok_ = true;
-  ESP_LOGI(TAG, "UART port %u error hook installed (parity, framing, RX overflow)",
-           static_cast<unsigned>(port));
-#else
-  ESP_LOGI(TAG, "Parity/framing flags require the ESP32 hardware UART");
-#endif
 }
 
 void NemtekComponent::loop() {
@@ -168,8 +92,6 @@ void NemtekComponent::ingest_(uint8_t byte, uint32_t now_us) {
   if (this->burst_len_ >= kBurstMax) {
     if (this->burst_dropped_ < 65535)
       this->burst_dropped_++;
-    // Keep the burst open until the wire is actually idle, and keep error totals.
-    (void) this->take_error_flags_();
     this->last_rx_us_ = now_us;
     this->have_rx_ = true;
     return;
@@ -186,40 +108,10 @@ void NemtekComponent::ingest_(uint8_t byte, uint32_t now_us) {
   const size_t index = this->burst_len_;
   this->burst_[index] = byte;
   this->delta_us_[index] = delta;
-  this->flags_[index] = this->take_error_flags_();
+  this->flags_[index] = 0;
   this->burst_len_++;
   this->last_rx_us_ = now_us;
   this->have_rx_ = true;
-}
-
-uint8_t NemtekComponent::take_error_flags_() {
-  const uint32_t parity = g_parity_errors;
-  const uint32_t frame = g_frame_errors;
-  const uint32_t overflow = g_overflow_errors;
-  const uint32_t d_parity = parity - this->parity_seen_;
-  const uint32_t d_frame = frame - this->frame_seen_;
-  const uint32_t d_overflow = overflow - this->overflow_seen_;
-  this->parity_seen_ = parity;
-  this->frame_seen_ = frame;
-  this->overflow_seen_ = overflow;
-  this->burst_parity_ += d_parity;
-  this->burst_frame_ += d_frame;
-  this->burst_overflow_ += d_overflow;
-
-  uint8_t flags = 0;
-  if (d_parity != 0)
-    flags |= FLAG_PARITY;
-  if (d_frame != 0)
-    flags |= FLAG_FRAME;
-  if (d_overflow != 0)
-    flags |= FLAG_OVERFLOW;
-  return flags;
-}
-
-void NemtekComponent::sync_error_counters_() {
-  this->parity_seen_ = g_parity_errors;
-  this->frame_seen_ = g_frame_errors;
-  this->overflow_seen_ = g_overflow_errors;
 }
 
 void NemtekComponent::finish_burst_() {
@@ -237,7 +129,11 @@ void NemtekComponent::finish_burst_() {
 bool NemtekComponent::classify_(MerlinState *state, bool *eb_present) const {
   *state = MerlinState::UNKNOWN;
   *eb_present = false;
-  if (this->burst_len_ < 5 || this->burst_[0] != 0x80 || this->burst_[1] != 0xFB)
+  // Idle fence-off on this Merlin 4 is the 3-byte frame 80 FB FF. A following
+  // byte about 30 ms later is a separate burst (past the 25 ms gap) and is not
+  // part of the state. Main required 5 bytes, so it only accepted off when a
+  // slow read glued that later byte, and more, onto the frame.
+  if (this->burst_len_ < 3 || this->burst_[0] != 0x80 || this->burst_[1] != 0xFB)
     return false;
 
   bool df_present = false;
@@ -249,7 +145,7 @@ bool NemtekComponent::classify_(MerlinState *state, bool *eb_present) const {
   *eb_present = eb;
 
   const uint8_t s0 = this->burst_[2];
-  const uint8_t s1 = this->burst_[3];
+  const uint8_t s1 = this->burst_len_ > 3 ? this->burst_[3] : 0x00;
   if (s0 == 0xF4 && s1 == 0xFE) {
     *state = MerlinState::ALARM;
   } else if (s0 == 0xFC && df_present) {
@@ -409,7 +305,6 @@ void NemtekComponent::set_capture_enabled(bool enabled) {
   this->repeat_count_ = 0;
   this->last_len_ = 0;
   if (enabled) {
-    this->sync_error_counters_();
     this->last_repeat_log_ms_ = millis();
     ESP_LOGW(TAG,
              "Capture ON. Logs may contain keypad PIN digits. Keep logs private and redact them before sharing.");
@@ -533,22 +428,11 @@ void NemtekComponent::log_capture_full_(const char *map_name) {
   }
 
   const bool sync = this->burst_len_ >= 2 && this->burst_[0] == 0x80 && this->burst_[1] == 0xFB;
-  char head[192];
-  if (this->error_hook_ok_) {
-    snprintf(head, sizeof(head),
-             "CAP t_us=%lu gap_us=%lu n=%u sync=%u map=%s drop=%u P=%lu F=%lu O=%lu%s",
-             static_cast<unsigned long>(this->burst_start_us_), static_cast<unsigned long>(this->burst_gap_us_),
-             static_cast<unsigned>(this->burst_len_), sync ? 1 : 0, map_name,
-             static_cast<unsigned>(this->burst_dropped_), static_cast<unsigned long>(this->burst_parity_),
-             static_cast<unsigned long>(this->burst_frame_), static_cast<unsigned long>(this->burst_overflow_),
-             batched ? " batch=1" : "");
-  } else {
-    snprintf(head, sizeof(head),
-             "CAP t_us=%lu gap_us=%lu n=%u sync=%u map=%s drop=%u err=n/a%s",
-             static_cast<unsigned long>(this->burst_start_us_), static_cast<unsigned long>(this->burst_gap_us_),
-             static_cast<unsigned>(this->burst_len_), sync ? 1 : 0, map_name,
-             static_cast<unsigned>(this->burst_dropped_), batched ? " batch=1" : "");
-  }
+  char head[160];
+  snprintf(head, sizeof(head), "CAP t_us=%lu gap_us=%lu n=%u sync=%u map=%s drop=%u%s",
+           static_cast<unsigned long>(this->burst_start_us_), static_cast<unsigned long>(this->burst_gap_us_),
+           static_cast<unsigned>(this->burst_len_), sync ? 1 : 0, map_name,
+           static_cast<unsigned>(this->burst_dropped_), batched ? " batch=1" : "");
   ESP_LOGI(TAG, "%s", head);
 
   char line[180];
@@ -562,21 +446,6 @@ void NemtekComponent::log_capture_full_(const char *map_name) {
         snprintf(token, sizeof(token), "%02X+%lu", this->burst_[i], static_cast<unsigned long>(this->delta_us_[i])));
     if (tlen >= sizeof(token))
       tlen = sizeof(token) - 1;
-    if ((this->flags_[i] & FLAG_PARITY) != 0 && tlen + 2 < sizeof(token)) {
-      token[tlen++] = '!';
-      token[tlen++] = 'P';
-      token[tlen] = '\0';
-    }
-    if ((this->flags_[i] & FLAG_FRAME) != 0 && tlen + 2 < sizeof(token)) {
-      token[tlen++] = '!';
-      token[tlen++] = 'F';
-      token[tlen] = '\0';
-    }
-    if ((this->flags_[i] & FLAG_OVERFLOW) != 0 && tlen + 2 < sizeof(token)) {
-      token[tlen++] = '!';
-      token[tlen++] = 'O';
-      token[tlen] = '\0';
-    }
     if (i > 0 && this->delta_us_[i] < BATCHED_DELTA_US && tlen + 1 < sizeof(token)) {
       token[tlen++] = '*';
       token[tlen] = '\0';
@@ -633,7 +502,7 @@ void NemtekComponent::dump_config() {
                 static_cast<unsigned long>(COMMS_TIMEOUT_MS));
   ESP_LOGCONFIG(TAG, "  Capture: %s, coalesce: %s", this->capture_switch_ != nullptr ? "switch" : "off",
                 this->capture_coalesce_ ? "yes" : "no");
-  ESP_LOGCONFIG(TAG, "  Capture error flags: %s", this->error_hook_ok_ ? "parity, framing, overflow" : "unavailable");
+  ESP_LOGCONFIG(TAG, "  UART thresholds: left at the ESPHome UART defaults");
   if (this->mark_text_ != nullptr) {
     ESP_LOGCONFIG(TAG, "  Mark text: '%s'", this->mark_text_->get_name().c_str());
   }

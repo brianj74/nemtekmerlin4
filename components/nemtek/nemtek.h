@@ -98,7 +98,6 @@ class NemtekComponent : public Component, public uart::UARTDevice {
     OFF,
   };
 
-  void prepare_uart_();
   void ingest_(uint8_t byte, uint32_t now_us);
   void finish_burst_();
   bool classify_(MerlinState *state, bool *eb_present) const;
@@ -120,8 +119,6 @@ class NemtekComponent : public Component, public uart::UARTDevice {
   void note_repeat_gap_();
   bool same_pattern_() const;
   bool timing_differs_() const;
-  uint8_t take_error_flags_();
-  void sync_error_counters_();
 
   static constexpr size_t kBurstMax = 48;
 
@@ -150,12 +147,6 @@ class NemtekComponent : public Component, public uart::UARTDevice {
   uint32_t repeat_gap_min_us_{0};
   uint32_t repeat_gap_max_us_{0};
   uint32_t last_repeat_log_ms_{0};
-
-  uint32_t parity_seen_{0};
-  uint32_t frame_seen_{0};
-  uint32_t overflow_seen_{0};
-  bool error_hook_ok_{false};
-  bool uart_prepared_{false};
 
   uint32_t last_valid_ms_{0};
   bool comms_state_{false};

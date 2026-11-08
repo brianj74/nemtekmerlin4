@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1 — 2026-11-08
+
+- Accept the 3-byte idle frame `80 FB FF` (no `DF`) as fence off, so Communications stays on while those frames arrive. Main required 5 bytes and only saw off when a slow read glued later bytes onto the frame.
+- Stop installing the UART parity/framing hook and stop forcing `rx_full_threshold` / `rx_timeout`. The hook replaced ESPHome's RX wake callback and stamped a parity error on every byte. The driver already keeps those bytes.
+
 ## 0.2.0 — 2026-11-08
 
 - Added optional receive-only bus capture. A Home Assistant switch (default off) logs every burst with per-byte microsecond gaps, parity/framing/overflow counts, and idle repeat coalescing. Fence decoding keeps running.

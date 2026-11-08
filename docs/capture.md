@@ -42,8 +42,6 @@ uart:
   parity: EVEN
   stop_bits: 1
   rx_buffer_size: 256
-  rx_full_threshold: 1
-  rx_timeout: 1
 ```
 
 4. Put sensors directly under `nemtek:`. A nested `binary_sensor:` block does not match the component and the config will fail validation. Add the capture switch and the mark text:
@@ -102,9 +100,9 @@ Use labels such as `idle`, `digit 0` … `digit 9`, `hash`, `star`, `fence on`, 
 The logger's own timestamp is when the line was printed. Byte timing is the `t_us` / `+` fields.
 
 ```text
-CAP t_us=1000000 gap_us=18000 n=6 sync=1 map=off drop=0 P=0 F=0 O=0
-CAP | 80+0 FB+4583 FC+4590 FF+4610 11+4588 00+4592
-CAP repeat x40 gap_us=16000-19000 n=6 80 FB FC FF 11 00
+CAP t_us=1000000 gap_us=60000 n=3 sync=1 map=off drop=0
+CAP | 80+0 FB+4400 FF+17500
+CAP repeat x40 gap_us=55000-62000 n=3 80 FB FF
 ```
 
 | Field | Meaning |
@@ -115,23 +113,24 @@ CAP repeat x40 gap_us=16000-19000 n=6 80 FB FC FF 11 00
 | `sync` | `1` when the burst starts `80 FB` |
 | `map` | Decoder result: `normal`, `low-power`, `voltage-low`, `alarm`, `off`, or `none` |
 | `drop` | Extra bytes past the 48-byte buffer |
-| `P` `F` `O` | Parity, framing, and RX-FIFO overflow counts for the burst |
-| `err=n/a` | This build could not see UART error flags |
 | `batch=1` | At least one byte was already queued when the loop read it |
 | `80+4583` | Byte `0x80`, then microseconds since the previous byte in the burst. The first byte is `+0` |
-| `!P` `!F` `!O` | Error flag attached to that byte (best effort; the header counts are exact) |
 | `*` | Delta under 250 µs, so the byte was sitting in the driver buffer. That number is not wire time |
 | `CAP repeat xN` | N further copies of the same bytes were counted instead of logged in full |
 
-Bursts split after **25 ms** of idle. A reply that follows a poll by a few milliseconds stays inside the same `CAP` record. Look for a `+` delta larger than the back-to-back byte time.
+Bursts split after **25 ms** of idle, the same gap main uses. With the fence off, the energiser sends `80 FB FF` (about 4 ms between `80` and `FB`, then about 17 ms before `FF`). That whole frame stays one burst and maps to `off`. A single byte (`79`, `F8`, `27`, `F7`, `4F`, `FB`, `7A`, cycling) follows about 30 ms later, so it is its own burst with `map=none`. It is not required for the fence-off state.
 
-At 2400 baud, 8 data bits, even parity, and 1 stop bit, one byte is 11 bit times: **4583 µs**. Bytes that follow each other on the wire land near that number. An extra idle of about 5 ms (the sort of poll-to-reply gap seen on other Nemtek keypads) shows up as a delta several milliseconds larger than 4583.
+Main's decoder ignored any burst shorter than 5 bytes. It still reported fence-off because a slow read often glued that later byte, and sometimes the next frame, onto `80 FB FF` before the 25 ms check ran. This build reads the gap from the wire time and accepts the 3-byte frame on its own. Communications stays on while those frames keep arriving.
 
-`map=none` is still logged. Those are the bursts the state decoder ignores, which is the point of capture.
+At 2400 baud, 8 data bits, even parity, and 1 stop bit, one byte is 11 bit times: **4583 µs**. Bytes that follow each other on the wire land near that number. An extra idle of about 5 ms shows up as a larger `+` delta inside the same burst.
 
-Identical bursts are coalesced when `capture_coalesce` is true. The first copy is logged in full. Further copies increment a counter, with a `CAP repeat` line at least every 5 seconds and again when the bytes change. A copy whose internal gaps differ by more than 2 ms is logged in full, so a delayed reply is not swallowed. Near-zero `*` deltas are ignored for that comparison.
+`map=none` is still logged. Those are the bursts the state decoder ignores.
 
-Parity, framing, and RX overflow come from the ESP32 UART status seen in the driver interrupt. The chip does not store the flag next to the byte, so `!P` / `!F` / `!O` may sit on the byte read just after the error. `P` / `F` / `O` on the header are the counts for the burst. Overflow means at least one byte was lost in the hardware FIFO.
+Identical bursts are coalesced when `capture_coalesce` is true. The first copy is logged in full. Further copies increment a counter, with a `CAP repeat` line at least every 5 seconds and again when the bytes change. A copy whose internal gaps differ by more than 2 ms is logged in full. Near-zero `*` deltas are ignored for that comparison.
+
+Leave `rx_full_threshold` and `rx_timeout` unset. At 2400 8E1 the ESPHome default threshold is already 1 byte, and the default timeout is 2 byte-times. Forcing timeout to 1 is not what split `80 FB FF` from the following byte (that gap is about 30 ms). The component does not change those UART settings.
+
+Capture does not collect parity or framing flags. On this bus the ESP32 even-parity checker raises a parity interrupt for every byte while still delivering the data byte. Reading that interrupt means replacing ESPHome's RX wake callback. That hook is not installed, and a parity error never discards a byte or resets the FIFO.
 
 ## Save the log
 
