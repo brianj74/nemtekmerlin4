@@ -1,6 +1,8 @@
 # Keypad transmit test
 
-This is opt-in. With `tx_enabled: false` the pin is never driven. GPIO21 stays the UART RX pad. When transmit is armed the firmware switches that pad to open-drain: level 0 pulls the bus low, level 1 releases it. It never drives the pin push-pull high.
+This is opt-in. With `tx_enabled: false` the pin is never driven. GPIO21 stays the UART RX pad. While Transmit Enable is on the pad stays an input with the pull-up re-applied, so it does not float and the UART keeps the pin between polls. Output is enabled only for the reply itself, open-drain: level 0 pulls the bus low, level 1 releases it. It never drives the pin push-pull high.
+
+The Dilbert66 MOSFET board is the bidirectional level shifter (same pin reads and writes). The MOSFET gate is tied to 3.3 V. Pulling GPIO21 low pulls DAT low. A high gate is the other circuit, the separate NPN, and this firmware does not do that. Panel idle on this pad is low, because the panel UART is inverted. A steady low after the stop bit is not treated as another device talking. The reply waits, up to 5 ms, for the pad to go high, and the read-back abort still releases the line if a bit does not match.
 
 The real keypad owns poll `4F`. Transmit refuses that slot. The default slot is `79`, one of the silent polls. The Merlin 4 can take more than one keypad; which silent poll it will accept is not known yet.
 
@@ -82,9 +84,9 @@ fence_pin: !secret fence_pin
 1. Set `tx_enabled: true` and reflash.
 2. Start `esphome logs your.yaml > tx-stage1.log` and leave it running.
 3. Pick slot `79` (or another silent poll, not `4F`).
-4. Turn **Nemtek Transmit Enable** on. Expect `Transmit on, slot 79, open-drain released`.
+4. Turn **Nemtek Transmit Enable** on. Expect `Transmit on, slot 79, input+pull-up level=...`. The boot log also has `Reset reason:`.
 5. Press **Nemtek Send Idle Reply** once.
-6. Look for `TX sent idle slot=79 latency=2.9ms readback=ok`. The latency is measured from the poll stop bit, seen by the GPIO edge interrupt, and the reply is started by a hardware timer rather than the main loop. A value outside 2.5–5.0 ms is counted instead of sent, and every 5 seconds you get `TX skip xN latency min-max` or `TX wait: slot 79 not seen`. Then for 3 seconds look for `TX ack repoll slot=79`. A re-poll means the panel treated the slot like a keypad. No re-poll means this slot was ignored. The status frame should stay whatever it was.
+6. Look for `TX sent idle slot=79 latency=2.9ms readback=ok level-before=1`. The latency is measured from the poll stop bit. A steady low is not a collision: the firmware waits until the pad is high or the 5 ms window ends. A skip line includes the raw level and recent edges, for example `TX skip: latency 5.0ms still low at window end level=0 edges-since-stop=0`. Every 5 seconds the same reasons are counted separately, so one reason is not labelled with another's latency. Then for 3 seconds look for `TX ack repoll slot=79`. A re-poll means the panel treated the slot like a keypad. No re-poll means this slot was ignored. The status frame should stay whatever it was.
 7. If the log says `read-back` or `watchdog`, the line was released and transmit is off. Stop and check the MOSFET board before trying again.
 8. Turn Transmit Enable off before the next stage.
 

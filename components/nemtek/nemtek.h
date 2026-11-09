@@ -239,7 +239,8 @@ class NemtekComponent : public Component, public uart::UARTDevice {
   void tx_fire_(uint32_t stop_us);
   friend void tx_byte_timer_cb(void *);
   friend void tx_reply_timer_cb(void *);
-  void tx_note_skip_(uint32_t latency_us, const char *why);
+  friend void tx_worker(void *);
+  void tx_note_skip_(uint32_t latency_us, const char *why, const char *detail = nullptr, bool immediate = false);
   void tx_flush_skips_(uint32_t now_ms);
   bool tx_want_() const;
   bool tx_send_(const uint8_t *bytes, uint8_t len, const char *what);

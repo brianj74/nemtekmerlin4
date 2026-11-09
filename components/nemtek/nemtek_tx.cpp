@@ -1,12 +1,17 @@
 #include "nemtek.h"
 
+#include <cstdio>
 #include <cstring>
 
 #include "esphome/core/log.h"
 
 #ifdef USE_ESP32
 #include <driver/gpio.h>
+#include <esp_rom_gpio.h>
 #include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <soc/gpio_sig_map.h>
 #endif
 
 namespace esphome {
@@ -32,6 +37,16 @@ static volatile uint16_t s_ew = 0;
 
 static volatile uint8_t s_assembling = 0;
 static volatile uint8_t s_busy = 0;
+static uint8_t s_level_before = 0;
+static volatile uint32_t s_last_edge_us = 0;
+static volatile uint32_t s_gen = 0;
+static volatile uint32_t s_armed_gen = 0;
+static volatile uint32_t s_armed_stop = 0;
+static volatile uint8_t s_reply_pending = 0;
+static TaskHandle_t s_tx_task = nullptr;
+
+void tx_worker(void *);
+static void schedule_reply_(uint32_t stop_us, uint32_t delay_us);
 
 void tx_byte_timer_cb(void *) {
   s_assembling = 0;
@@ -41,8 +56,16 @@ void tx_byte_timer_cb(void *) {
 }
 
 void tx_reply_timer_cb(void *) {
-  if (s_owner != nullptr)
-    s_owner->tx_fire_(s_owner->tx_stop_us_);
+  if (s_tx_task != nullptr)
+    xTaskNotifyGive(s_tx_task);
+}
+
+void tx_worker(void *) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    if (s_owner != nullptr)
+      s_owner->tx_fire_(s_armed_stop);
+  }
 }
 
 void nemtek_tx_on_edge(uint32_t now_us, uint8_t level) {
@@ -50,6 +73,13 @@ void nemtek_tx_on_edge(uint32_t now_us, uint8_t level) {
     s_last_level = level;
     return;
   }
+  // A floating pad can chatter far faster than a 2400 baud edge (~417 us).
+  // Drop those so the interrupt cannot starve Wi-Fi.
+  if (s_last_edge_us != 0 && static_cast<int32_t>(now_us - s_last_edge_us) < 80) {
+    s_last_level = level;
+    return;
+  }
+  s_last_edge_us = now_us;
   const uint16_t w = s_ew;
   s_et[w % kTxRing] = now_us;
   s_el[w % kTxRing] = level;
@@ -57,6 +87,13 @@ void nemtek_tx_on_edge(uint32_t now_us, uint8_t level) {
   // A new panel byte starts on a rising edge only while we are not already
   // inside a byte. Data bits that rise mid-byte must not restart the timer.
   if (level != 0 && s_last_level == 0 && s_assembling == 0 && s_byte_timer != nullptr) {
+    // A reply armed for an older frame must not fire after this start bit.
+    if (s_reply_pending != 0 && static_cast<int32_t>(now_us - s_armed_stop) > 8000) {
+      s_gen++;
+      s_reply_pending = 0;
+      if (s_reply_timer != nullptr)
+        esp_timer_stop(s_reply_timer);
+    }
     s_assembling = 1;
     s_start_us = now_us;
     esp_timer_stop(s_byte_timer);
@@ -176,15 +213,47 @@ void NemtekComponent::set_fence_pin(const char *pin) {
     ESP_LOGE(TAG_TX, "Fence PIN empty; fence control will refuse");
 }
 
+#ifdef USE_ESP32
+// Bidirectional BSS138-style shifter (Dilbert66 MOSFET board, same pin for
+// read and write): gate is tied to 3.3 V, source is GPIO21, drain is DAT.
+// GPIO low pulls DAT low. GPIO high or Hi-Z releases DAT. This is not the
+// separate NPN write transistor, which would need a high gate.
+static void pin_idle_(gpio_num_t pin) {
+  gpio_set_level(pin, 1);
+  gpio_set_direction(pin, GPIO_MODE_INPUT);
+  gpio_pulldown_dis(pin);
+  gpio_pullup_en(pin);
+}
+
+static void pin_drive_od_(gpio_num_t pin) {
+  // Level 1 first so open-drain enable cannot push the bus high.
+  gpio_set_level(pin, 1);
+  gpio_set_direction(pin, GPIO_MODE_INPUT_OUTPUT_OD);
+  gpio_pulldown_dis(pin);
+  gpio_pullup_en(pin);
+  // Bind the pad output to the GPIO register without gpio_reset_pin, which
+  // would drop the UART RX route. Input stays enabled for read-back.
+  esp_rom_gpio_connect_out_signal(static_cast<uint32_t>(pin), SIG_GPIO_OUT_IDX, false, false);
+  gpio_set_level(pin, 1);
+  gpio_set_direction(pin, GPIO_MODE_INPUT_OUTPUT_OD);
+  gpio_pullup_en(pin);
+}
+#endif
+
 void NemtekComponent::release_line_() {
   this->tx_armed_ = false;
 #ifdef USE_ESP32
   g_tx_abort = 0;
-  if (this->edge_pin_ >= 0) {
-    const gpio_num_t pin = static_cast<gpio_num_t>(this->edge_pin_);
-    gpio_set_level(pin, 1);
-    gpio_set_direction(pin, GPIO_MODE_INPUT);
-  }
+  s_busy = 0;
+  s_reply_pending = 0;
+  s_gen++;
+  if (s_reply_timer != nullptr)
+    esp_timer_stop(s_reply_timer);
+  if (s_byte_timer != nullptr)
+    esp_timer_stop(s_byte_timer);
+  s_assembling = 0;
+  if (this->edge_pin_ >= 0)
+    pin_idle_(static_cast<gpio_num_t>(this->edge_pin_));
 #endif
 }
 
@@ -233,10 +302,6 @@ void NemtekComponent::set_tx_enabled(bool enabled) {
     this->release_line_();
 #ifdef USE_ESP32
     s_listen = 0;
-    if (s_byte_timer != nullptr)
-      esp_timer_stop(s_byte_timer);
-    if (s_reply_timer != nullptr)
-      esp_timer_stop(s_reply_timer);
     if (this->edge_isr_ok_) {
       if (this->capture_enabled_)
         gpio_intr_enable(static_cast<gpio_num_t>(this->edge_pin_));
@@ -252,10 +317,10 @@ void NemtekComponent::set_tx_enabled(bool enabled) {
 #ifdef USE_ESP32
   const gpio_num_t pin = static_cast<gpio_num_t>(this->edge_pin_);
   this->service_edge_window_(true);
-  gpio_set_direction(pin, GPIO_MODE_INPUT_OUTPUT_OD);
-  gpio_set_level(pin, 1);
+  // Stay an input while armed. Output is enabled only for the reply itself,
+  // so the UART RX route is not held in a drive mode between polls.
+  pin_idle_(pin);
   s_owner = this;
-  s_listen = 1;
   if (s_byte_timer == nullptr) {
     esp_timer_create_args_t args = {};
     args.callback = &tx_byte_timer_cb;
@@ -266,8 +331,21 @@ void NemtekComponent::set_tx_enabled(bool enabled) {
     args.name = "nemtek_reply";
     esp_timer_create(&args, &s_reply_timer);
   }
+  if (s_tx_task == nullptr) {
+    // Core 1 is the app cpu. The bit timing loop must not run on the Wi-Fi core.
+    if (xTaskCreatePinnedToCore(tx_worker, "nemtek_tx", 4096, nullptr, 10, &s_tx_task, 1) != pdPASS)
+      ESP_LOGE(TAG_TX, "Transmit task was not created; replies will not be sent");
+  }
+  s_listen = 1;
   if (this->edge_isr_ok_)
     gpio_intr_enable(pin);
+  const int level = gpio_get_level(pin);
+  ESP_LOGW(TAG_TX,
+           "Transmit on, slot %02X, input+pull-up level=%d. Output stays off until a reply. "
+           "GPIO low pulls DAT low (MOSFET shifter). Edge capture suspended.",
+           this->tx_slot_, level);
+#else
+  ESP_LOGW(TAG_TX, "Transmit on, slot %02X. Edge capture suspended.", this->tx_slot_);
 #endif
   this->tx_stat_ms_ = millis();
   this->tx_slot_seen_ = 0;
@@ -276,7 +354,6 @@ void NemtekComponent::set_tx_enabled(bool enabled) {
   this->tx_runtime_ = true;
   if (this->tx_enable_switch_ != nullptr)
     this->tx_enable_switch_->publish_state(true);
-  ESP_LOGW(TAG_TX, "Transmit on, slot %02X, open-drain released. Edge capture suspended.", this->tx_slot_);
 }
 
 void NemtekComponent::set_idle_responder(bool enabled) {
@@ -333,31 +410,71 @@ bool NemtekComponent::tx_want_() const {
   return this->key_q_len_ > 0 || this->need_idle_ack_ || this->one_shot_idle_ || this->idle_responder_;
 }
 
-void NemtekComponent::tx_note_skip_(uint32_t latency_us, const char *why) {
-  if (this->tx_skip_n_ == 0 || latency_us < this->tx_skip_min_us_)
-    this->tx_skip_min_us_ = latency_us;
-  if (latency_us > this->tx_skip_max_us_)
-    this->tx_skip_max_us_ = latency_us;
-  this->tx_skip_n_++;
-  this->tx_skip_why_ = why;
+struct TxSkipBucket {
+  const char *why;
+  uint32_t n;
+  uint32_t min_us;
+  uint32_t max_us;
+  char detail[140];
+};
+
+static TxSkipBucket s_skips[4];
+
+static void format_ms_(char *buf, size_t n, uint32_t us) {
+  snprintf(buf, n, "%lu.%lu", static_cast<unsigned long>(us / 1000), static_cast<unsigned long>((us % 1000) / 100));
+}
+
+void NemtekComponent::tx_note_skip_(uint32_t latency_us, const char *why, const char *detail, bool immediate) {
+  if (why == nullptr)
+    why = "skip";
+  TxSkipBucket *slot = nullptr;
+  for (auto &bucket : s_skips) {
+    if (bucket.why == why || (bucket.why != nullptr && std::strcmp(bucket.why, why) == 0)) {
+      slot = &bucket;
+      break;
+    }
+    if (bucket.n == 0 && slot == nullptr)
+      slot = &bucket;
+  }
+  if (slot == nullptr)
+    slot = &s_skips[0];
+  if (slot->n == 0 || latency_us < slot->min_us)
+    slot->min_us = latency_us;
+  if (latency_us > slot->max_us)
+    slot->max_us = latency_us;
+  slot->n++;
+  slot->why = why;
+  if (detail != nullptr)
+    snprintf(slot->detail, sizeof(slot->detail), "%s", detail);
+  if (immediate) {
+    char lat[16];
+    format_ms_(lat, sizeof(lat), latency_us);
+    ESP_LOGW(TAG_TX, "TX skip: latency %sms %s%s%s", lat, why, detail != nullptr ? " " : "",
+             detail != nullptr ? detail : "");
+  }
 }
 
 void NemtekComponent::tx_flush_skips_(uint32_t now_ms) {
   if (static_cast<uint32_t>(now_ms - this->tx_stat_ms_) < 5000)
     return;
-  if (this->tx_skip_n_ > 0) {
-    ESP_LOGW(TAG_TX, "TX skip x%lu latency %lu.%lums-%lu.%lums (%s)", static_cast<unsigned long>(this->tx_skip_n_),
-             static_cast<unsigned long>(this->tx_skip_min_us_ / 1000),
-             static_cast<unsigned long>((this->tx_skip_min_us_ % 1000) / 100),
-             static_cast<unsigned long>(this->tx_skip_max_us_ / 1000),
-             static_cast<unsigned long>((this->tx_skip_max_us_ % 1000) / 100),
-             this->tx_skip_why_ != nullptr ? this->tx_skip_why_ : "late");
+  for (auto &bucket : s_skips) {
+    if (bucket.n == 0)
+      continue;
+    char lo[16];
+    char hi[16];
+    format_ms_(lo, sizeof(lo), bucket.min_us);
+    format_ms_(hi, sizeof(hi), bucket.max_us);
+    ESP_LOGW(TAG_TX, "TX skip x%lu latency %sms-%sms (%s)%s%s", static_cast<unsigned long>(bucket.n), lo, hi,
+             bucket.why != nullptr ? bucket.why : "skip", bucket.detail[0] != '\0' ? " " : "",
+             bucket.detail[0] != '\0' ? bucket.detail : "");
+    bucket.n = 0;
+    bucket.min_us = 0;
+    bucket.max_us = 0;
+    bucket.detail[0] = '\0';
+    bucket.why = nullptr;
   }
   if (this->tx_runtime_ && this->tx_want_() && this->tx_slot_seen_ == 0)
     ESP_LOGW(TAG_TX, "TX wait: slot %02X not seen", this->tx_slot_);
-  this->tx_skip_n_ = 0;
-  this->tx_skip_min_us_ = 0;
-  this->tx_skip_max_us_ = 0;
   this->tx_slot_seen_ = 0;
   this->tx_stat_ms_ = now_ms;
 }
@@ -375,11 +492,14 @@ void NemtekComponent::tx_on_poll_(uint8_t poll, uint32_t now_us) {
   if (static_cast<int32_t>(now_us - this->tx_edge_sched_us_) < 20000)
     return;
   if (this->tx_want_()) {
-    const uint32_t late = this->tx_poll_us_ == 0 ? 0 : static_cast<uint32_t>(now_us - this->tx_poll_us_);
+    // Do not report the gap since the previous poll as a stop-bit latency.
+    // That gap is one 7-poll cycle (~0.8-1.1 s) and is not a reply time.
     if (this->burst_len_ > 1 && this->burst_[0] == 0x80)
-      this->tx_note_skip_(late, "glued to status");
+      this->tx_note_skip_(0, "glued to status");
+    else if (this->tx_edge_sched_us_ == 0)
+      this->tx_note_skip_(0, "slot on uart, no stop edge");
     else
-      this->tx_note_skip_(late, "uart late, no stop edge");
+      this->tx_note_skip_(static_cast<uint32_t>(now_us - this->tx_edge_sched_us_), "uart late vs stop edge");
   }
   this->tx_poll_us_ = now_us;
 }
@@ -405,21 +525,15 @@ bool NemtekComponent::tx_send_(const uint8_t *bytes, uint8_t len, const char *wh
   return false;
 #else
   s_busy = 1;
+  s_reply_pending = 0;
   if (s_reply_timer != nullptr)
     esp_timer_stop(s_reply_timer);
   if (s_byte_timer != nullptr)
     esp_timer_stop(s_byte_timer);
   s_assembling = 0;
   const gpio_num_t pin = static_cast<gpio_num_t>(this->edge_pin_);
-  if (g_tx_abort != 0 || gpio_get_level(pin) == 0) {
-    gpio_set_level(pin, 1);
-    s_busy = 0;
-    ESP_LOGW(TAG_TX, "TX abort %s: line not released", what);
-    this->key_q_len_ = 0;
-    this->one_shot_idle_ = false;
-    this->need_idle_ack_ = false;
-    return false;
-  }
+  // Output turns on only for this frame, and only open-drain.
+  pin_drive_od_(pin);
   g_tx_abort = 0;
   const uint32_t t0 = micros();
   bool ok = true;
@@ -454,7 +568,7 @@ bool NemtekComponent::tx_send_(const uint8_t *bytes, uint8_t len, const char *wh
       }
     }
   }
-  gpio_set_level(pin, 1);
+  pin_idle_(pin);
   if (!ok || g_tx_abort != 0) {
     this->release_line_();
     this->tx_runtime_ = false;
@@ -470,8 +584,9 @@ bool NemtekComponent::tx_send_(const uint8_t *bytes, uint8_t len, const char *wh
     return false;
   }
   const uint32_t latency = t0 - this->tx_stop_us_;
-  ESP_LOGI(TAG_TX, "TX sent %s slot=%02X latency=%lu.%lums readback=ok", what, this->tx_slot_,
-           static_cast<unsigned long>(latency / 1000), static_cast<unsigned long>((latency % 1000) / 100));
+  ESP_LOGI(TAG_TX, "TX sent %s slot=%02X latency=%lu.%lums readback=ok level-before=%u", what, this->tx_slot_,
+           static_cast<unsigned long>(latency / 1000), static_cast<unsigned long>((latency % 1000) / 100),
+           static_cast<unsigned>(s_level_before));
   this->tx_watch_until_ms_ = millis() + 3000;
   s_busy = 0;
   return true;
@@ -550,38 +665,114 @@ void NemtekComponent::tx_on_edge_byte_(uint32_t start_us) {
   const uint32_t stop_us = start_us + (11ULL * 1000000ULL) / 2400ULL;
   this->tx_stop_us_ = stop_us;
   this->tx_edge_sched_us_ = micros();
-  const uint32_t target = stop_us + this->tx_reply_us_;
-  const int32_t wait = static_cast<int32_t>(target - micros());
-  if (wait > 200 && s_reply_timer != nullptr) {
-    esp_timer_stop(s_reply_timer);
-    esp_timer_start_once(s_reply_timer, static_cast<uint64_t>(wait));
+  const int32_t wait = static_cast<int32_t>((stop_us + this->tx_reply_us_) - micros());
+  if (wait > static_cast<int32_t>(this->tx_reply_max_us_)) {
+    this->tx_note_skip_(static_cast<uint32_t>(wait), "stop edge already outside window");
     return;
   }
-  this->tx_fire_(stop_us);
+  schedule_reply_(stop_us, wait > 0 ? static_cast<uint32_t>(wait) : 1);
 #else
   (void) start_us;
 #endif
 }
 
+#ifdef USE_ESP32
+static void schedule_reply_(uint32_t stop_us, uint32_t delay_us) {
+  s_armed_stop = stop_us;
+  s_armed_gen = s_gen;
+  s_reply_pending = 1;
+  if (s_reply_timer == nullptr || s_tx_task == nullptr)
+    return;
+  esp_timer_stop(s_reply_timer);
+  if (esp_timer_start_once(s_reply_timer, delay_us == 0 ? 1 : delay_us) != ESP_OK) {
+    esp_timer_stop(s_reply_timer);
+    esp_timer_start_once(s_reply_timer, delay_us == 0 ? 1 : delay_us);
+  }
+}
+
+static void describe_edges_(char *buf, size_t n, uint32_t stop_us, uint32_t now, int level, int *since_out) {
+  uint32_t times[6];
+  uint8_t levels[6];
+  int kept = 0;
+  int since = 0;
+  const uint16_t wr = s_ew;
+  for (int i = 0; i < kTxRing; i++) {
+    const uint16_t idx = static_cast<uint16_t>((wr + kTxRing - 1 - i) % kTxRing);
+    const uint32_t et = s_et[idx];
+    if (static_cast<int32_t>(et - stop_us) <= 0)
+      continue;
+    if (static_cast<int32_t>(et - now) > 0)
+      continue;
+    since++;
+    if (kept < 6) {
+      int j = kept;
+      while (j > 0 && static_cast<int32_t>(times[j - 1] - et) > 0) {
+        times[j] = times[j - 1];
+        levels[j] = levels[j - 1];
+        j--;
+      }
+      times[j] = et;
+      levels[j] = s_el[idx];
+      kept++;
+    }
+  }
+  *since_out = since;
+  int pos = snprintf(buf, n, "level=%d edges-since-stop=%d", level, since);
+  for (int i = 0; i < kept && pos > 0 && static_cast<size_t>(pos) < n; i++) {
+    const int32_t dt = static_cast<int32_t>(times[i] - stop_us);
+    pos += snprintf(buf + pos, n - static_cast<size_t>(pos), " %+ldus/%u", static_cast<long>(dt),
+                    static_cast<unsigned>(levels[i]));
+  }
+}
+#endif
+
 void NemtekComponent::tx_fire_(uint32_t stop_us) {
+#ifdef USE_ESP32
+  if (s_armed_gen != s_gen)
+    return;
+#endif
   if (!this->tx_runtime_ || this->tx_fault_ || !this->tx_want_())
     return;
   const uint32_t now = micros();
-  const uint32_t target = stop_us + this->tx_reply_us_;
-  if (static_cast<int32_t>(target - now) > 0 && static_cast<int32_t>(target - now) < 4000) {
-    while (static_cast<int32_t>(micros() - target) < 0) {
-    }
+  const uint32_t latency = now - stop_us;
+  if (latency > this->tx_reply_max_us_) {
+#ifdef USE_ESP32
+    s_reply_pending = 0;
+#endif
+    this->tx_note_skip_(latency, "stale stop bit");
+    return;
   }
-  const uint32_t latency = micros() - stop_us;
-  if (latency < this->tx_reply_min_us_ || latency > this->tx_reply_max_us_) {
-    this->tx_note_skip_(latency, "outside 2.5-5.0 ms");
+  if (latency + 150 < this->tx_reply_min_us_) {
+#ifdef USE_ESP32
+    schedule_reply_(stop_us, this->tx_reply_min_us_ - latency);
+#endif
     return;
   }
 #ifdef USE_ESP32
-  if (this->edge_pin_ >= 0 && gpio_get_level(static_cast<gpio_num_t>(this->edge_pin_)) == 0) {
-    this->tx_note_skip_(latency, "line still low");
+  const gpio_num_t pin = static_cast<gpio_num_t>(this->edge_pin_);
+  const int level = this->edge_pin_ >= 0 ? gpio_get_level(pin) : 1;
+  char detail[140];
+  int since = 0;
+  describe_edges_(detail, sizeof(detail), stop_us, now, level, &since);
+  // Several edges after the stop bit mean a byte is still moving. A steady
+  // level, including low, is inverted idle or the panel not having released
+  // yet. Low by itself is not a collision: panel idle is pad LOW.
+  if (since >= 2 || (since == 1 && level == 0)) {
+    s_reply_pending = 0;
+    this->tx_note_skip_(latency, "activity after stop", detail, true);
     return;
   }
+  if (level == 0) {
+    if (latency + 250 < this->tx_reply_max_us_) {
+      schedule_reply_(stop_us, 250);
+      return;
+    }
+    s_reply_pending = 0;
+    this->tx_note_skip_(latency, "still low at window end", detail, true);
+    return;
+  }
+  s_level_before = static_cast<uint8_t>(level);
+  s_reply_pending = 0;
 #endif
   this->tx_stop_us_ = stop_us;
   uint8_t frame[3] = {0xFE, 0x04, 0x03};

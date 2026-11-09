@@ -12,6 +12,7 @@
 
 #include "esphome/components/uart/uart_component_esp_idf.h"
 #include "esphome/core/application.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "hal/uart_ll.h"
 #endif
@@ -121,7 +122,39 @@ void NemtekMarkText::control(const std::string &value) {
   this->publish_state("");
 }
 
+#ifdef USE_ESP32
+static const char *reset_reason_name_(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON:
+      return "power-on";
+    case ESP_RST_SW:
+      return "software";
+    case ESP_RST_PANIC:
+      return "panic";
+    case ESP_RST_INT_WDT:
+      return "interrupt-watchdog";
+    case ESP_RST_TASK_WDT:
+      return "task-watchdog";
+    case ESP_RST_WDT:
+      return "other-watchdog";
+    case ESP_RST_DEEPSLEEP:
+      return "deep-sleep";
+    case ESP_RST_BROWNOUT:
+      return "brownout";
+    case ESP_RST_SDIO:
+      return "sdio";
+    default:
+      return "unknown";
+  }
+}
+#endif
+
 void NemtekComponent::setup() {
+#ifdef USE_ESP32
+  const esp_reset_reason_t reason = esp_reset_reason();
+  ESP_LOGW(TAG, "Reset reason: %s (%d). Panic and watchdog backtraces are printed on the USB log before reboot.",
+           reset_reason_name_(reason), static_cast<int>(reason));
+#endif
   ESP_LOGI(TAG, "Starting receive-only Nemtek Merlin 4 monitor");
   ESP_LOGI(TAG, "Capture logs can contain keypad PIN digits. Keep them private.");
   this->burst_len_ = 0;
@@ -528,6 +561,9 @@ void NemtekComponent::install_edge_isr_() {
     return;
   }
   gpio_input_enable(pin);
+  // Keep the pad from floating. This does not retake the UART function.
+  gpio_pulldown_dis(pin);
+  gpio_pullup_en(pin);
   gpio_set_intr_type(pin, GPIO_INTR_ANYEDGE);
   const esp_err_t added = gpio_isr_handler_add(pin, nemtek_edge_isr, nullptr);
   if (added != ESP_OK) {

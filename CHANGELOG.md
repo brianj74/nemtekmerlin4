@@ -6,6 +6,7 @@
 - Stage buttons send one idle reply or one test digit. An idle-responder switch answers the chosen silent slot with `FE 04 03`. Fence on/off and `*3#` stay behind `fence_control` and `!secret fence_pin`, which is never logged.
 - Keypad edge decode now uses non-inverted 8E1 (`EDGE kp`). Capture windows stay off while transmit is armed; the edge interrupt stays on to time the poll stop bit.
 - A queued reply is started from that stop-bit time by a one-shot timer, inside a 2.5–5.0 ms window (`tx_reply`, `tx_reply_min`, `tx_reply_max`). Misses are summarised every 5 s (`TX skip xN`, `TX wait: slot XX not seen`) instead of being dropped silently.
+- A steady low pad is panel idle, not a collision. The pull-up is re-applied, the pin stays an input until the reply, and the open-drain drive is GPIO-low = DAT-low through the MOSFET shifter. Skip lines include the raw level and recent edges. The boot log names the reset reason.
 
 ## 0.2.2 — 2026-11-09
 
