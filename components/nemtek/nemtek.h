@@ -48,6 +48,16 @@ class NemtekComponent : public Component, public uart::UARTDevice {
   void set_capture_switch(NemtekCaptureSwitch *capture_switch) { this->capture_switch_ = capture_switch; }
   void set_mark_text(NemtekMarkText *mark_text) { this->mark_text_ = mark_text; }
   void set_capture_coalesce(bool coalesce) { this->capture_coalesce_ = coalesce; }
+  void set_parity_odd(bool odd) {
+    this->parity_override_ = true;
+    this->parity_odd_ = odd;
+  }
+  // GPIO number of the UART RX pad. The interrupt is input-only and does not
+  // retake the pin, so the UART keeps receiving.
+  void set_edge_pin(int pin) { this->edge_pin_ = pin; }
+  void set_edge_window_us(uint32_t window_us) { this->edge_window_us_ = window_us; }
+  void set_edge_after_4f_only(bool only_4f) { this->edge_after_4f_only_ = only_4f; }
+  void set_edge_inverted(bool inverted) { this->edge_inverted_ = inverted; }
 
   // Runtime toggle used by the capture switch. Starts off.
   void set_capture_enabled(bool enabled);
@@ -111,6 +121,16 @@ class NemtekComponent : public Component, public uart::UARTDevice {
   const char *state_name_(MerlinState state) const;
   const char *map_token_(MerlinState state) const;
 
+  void on_uart_byte_(uint8_t byte, uint32_t now_us);
+  void service_edge_window_(bool force);
+  void log_edge_window_(uint8_t poll, uint32_t start_us, uint16_t count);
+  void log_summary_(uint32_t now_ms);
+  void remember_mark_(const char *label, uint32_t t_us);
+  void install_edge_isr_();
+  void install_uart_error_hook_();
+  void apply_parity_override_();
+  const char *uart_parity_name_() const;
+
   void log_capture_();
   void log_capture_full_(const char *map_name);
   void log_repeat_(uint32_t extra_count);
@@ -147,6 +167,36 @@ class NemtekComponent : public Component, public uart::UARTDevice {
   uint32_t repeat_gap_min_us_{0};
   uint32_t repeat_gap_max_us_{0};
   uint32_t last_repeat_log_ms_{0};
+  uint32_t last_summary_ms_{0};
+
+  static constexpr uint8_t kMarkSlots = 8;
+  static constexpr uint8_t kMarkLen = 48;
+  char pending_mark_[kMarkSlots][kMarkLen + 1]{};
+  uint32_t pending_mark_us_[kMarkSlots]{};
+  uint8_t pending_mark_count_{0};
+  bool pending_mark_overflow_{false};
+
+  int edge_pin_{-1};
+  uint32_t edge_window_us_{30000};
+  bool edge_after_4f_only_{false};
+  bool edge_inverted_{true};
+  bool edge_isr_ok_{false};
+  bool parity_override_{false};
+  bool parity_odd_{false};
+  uint32_t parity_seen_{0};
+  uint32_t frame_seen_{0};
+  uint32_t status_count_{0};
+  uint32_t poll_count_{0};
+  uint32_t poll_4f_count_{0};
+  uint32_t other_count_{0};
+  uint32_t edge_quiet_{0};
+  uint32_t edge_hit_{0};
+  bool window_armed_{false};
+  uint32_t window_start_us_{0};
+  uint8_t window_poll_{0};
+  uint8_t last_status_[16]{};
+  uint8_t last_status_len_{0};
+  bool have_status_{false};
 
   uint32_t last_valid_ms_{0};
   bool comms_state_{false};

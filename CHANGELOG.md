@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.2 — 2026-11-09
+
+- Capture an input-only GPIO edge window after each poll byte and print pulse timings plus 2400 baud 8E1, 8O1, 8N1, and 9-bit decode attempts. Quiet windows are counted, not printed.
+- Optional `parity: ODD` (or `EVEN`). The 5 s summary reports parity and framing error counts for the parity in use.
+- Idle status frames and poll bytes are counted instead of logged. Marks are logged immediately and repeated on the next summary line.
+- Example logger uses `task_log_buffer_size: 4096` with `nemtek` at DEBUG.
+
 ## 0.2.1 — 2026-11-08
 
 - Accept the 3-byte idle frame `80 FB FF` (no `DF`) as fence off, so Communications stays on while those frames arrive. Main required 5 bytes and only saw off when a slow read glued later bytes onto the frame.

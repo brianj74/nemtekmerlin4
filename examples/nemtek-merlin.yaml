@@ -22,7 +22,16 @@ esp32:
     type: esp-idf
 
 logger:
-  level: INFO
+  # DEBUG is required so nemtek byte timings are compiled in. Idle frames are
+  # not printed; only changes, keypad edge windows, marks, and a 5 s summary.
+  level: DEBUG
+  task_log_buffer_size: 4096
+  logs:
+    nemtek: DEBUG
+    wifi: INFO
+    api: INFO
+    uart: INFO
+    mdns: INFO
 
 wifi:
   ssid: !secret wifi_ssid
@@ -50,14 +59,21 @@ uart:
     inverted: true
   baud_rate: 2400
   data_bits: 8
-  parity: EVEN
+  # ODD: an earlier capture flagged even-parity on every byte, including 80 and FF.
+  # Change to EVEN to compare the P= count in the CAP sum line.
+  parity: ODD
   stop_bits: 1
   rx_buffer_size: 256
 
 nemtek:
   uart_id: nemtek_uart
-  # Identical idle bursts are counted instead of logged one by one.
-  # Set false only for a short capture if you need every repeat in full.
+  # Applies ODD on the already-open UART without retaking the pin.
+  parity: ODD
+  # GPIO21 stays the UART RX pad. This only arms an input edge interrupt.
+  edge_pin: 21
+  edge_window: 30ms
+  edge_after: ALL
+  edge_inverted: true
   capture_coalesce: true
   capture:
     name: "Nemtek Capture"

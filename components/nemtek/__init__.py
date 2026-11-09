@@ -59,6 +59,11 @@ schema[cv.Optional(CONF_MARK)] = text.text_schema(
     mode="TEXT",
 )
 schema[cv.Optional(CONF_CAPTURE_COALESCE, default=True)] = cv.boolean
+schema[cv.Optional("parity")] = cv.one_of("EVEN", "ODD", upper=True)
+schema[cv.Optional("edge_pin")] = cv.int_range(min=0, max=39)
+schema[cv.Optional("edge_window", default="30ms")] = cv.positive_time_period_microseconds
+schema[cv.Optional("edge_after", default="ALL")] = cv.one_of("ALL", "4F", upper=True)
+schema[cv.Optional("edge_inverted", default=True)] = cv.boolean
 schema[cv.Optional("binary_sensor")] = cv.invalid(
     "Put each sensor directly under 'nemtek:'. "
     'Example: nemtek -> communications -> name: "Nemtek Communications"'
@@ -74,6 +79,13 @@ async def to_code(config):
     await cg.register_component(var, config)
     await uart.register_uart_device(var, config)
     cg.add(var.set_capture_coalesce(config[CONF_CAPTURE_COALESCE]))
+    if "parity" in config:
+        cg.add(var.set_parity_odd(config["parity"] == "ODD"))
+    if "edge_pin" in config:
+        cg.add(var.set_edge_pin(config["edge_pin"]))
+        cg.add(var.set_edge_window_us(config["edge_window"].total_microseconds))
+        cg.add(var.set_edge_after_4f_only(config["edge_after"] == "4F"))
+        cg.add(var.set_edge_inverted(config["edge_inverted"]))
 
     for key, (setter, _) in SENSORS.items():
         if key in config:

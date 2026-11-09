@@ -29,7 +29,7 @@ external_components:
     components: [nemtek]
 ```
 
-3. Keep the UART receive-only. GPIO21, inverted, 2400 8E1. Do not add `tx_pin`.
+3. Keep the UART receive-only. GPIO21, inverted, 2400 baud. Do not add `tx_pin`. Use odd parity first; switch the same key to `EVEN` only to compare the `P=` count.
 
 ```yaml
 uart:
@@ -39,16 +39,37 @@ uart:
     inverted: true
   baud_rate: 2400
   data_bits: 8
-  parity: EVEN
+  parity: ODD
   stop_bits: 1
   rx_buffer_size: 256
 ```
 
-4. Put sensors directly under `nemtek:`. A nested `binary_sensor:` block does not match the component and the config will fail validation. Add the capture switch and the mark text:
+4. Logger. `task_log_buffer_size` is the ESPHome 2026.10 key (default 768, which dropped lines). `level: DEBUG` keeps nemtek byte timings in the binary. Idle frames are not printed.
+
+```yaml
+logger:
+  level: DEBUG
+  task_log_buffer_size: 4096
+  logs:
+    nemtek: DEBUG
+    wifi: INFO
+    api: INFO
+    uart: INFO
+    mdns: INFO
+```
+
+Keep `baud_rate: 0` if that is how this board already logs (USB). Do not point the logger UART at GPIO21.
+
+5. Put sensors directly under `nemtek:`. A nested `binary_sensor:` block does not match the component and the config will fail validation. `edge_pin` only enables an input edge interrupt on the existing RX pad.
 
 ```yaml
 nemtek:
   uart_id: nemtek_uart
+  parity: ODD
+  edge_pin: 21
+  edge_window: 30ms
+  edge_after: ALL   # or 4F, to arm a window only after poll 4F
+  edge_inverted: true
   capture_coalesce: true
   capture:
     name: "Nemtek Capture"
@@ -61,10 +82,10 @@ nemtek:
   # ...the other sensors, same names as before
 ```
 
-`capture_coalesce` defaults to true. Leave it on for the checklist.
+`capture_coalesce` defaults to true. Leave it on. `edge_after: 4F` is enough for the known keypad slot; `ALL` also arms the other poll bytes and only prints a window when extra edges appear.
 
-5. **Install** → **Wirelessly**. The first install of this branch should be a normal OTA update from the dashboard.
-6. If the build still uses the previous component, run **Clean Build Files** and install again. ESPHome caches git external components.
+6. **Install** → **Wirelessly**. The first install of this branch should be a normal OTA update from the dashboard.
+7. If the build still uses the previous component, run **Clean Build Files** and install again. ESPHome caches git external components.
 
 A full board config is in [examples/nemtek-merlin.yaml](../examples/nemtek-merlin.yaml). Copy it only for a new device. An existing device keeps its own `esp32:`, `wifi:`, `api:`, and `ota:` blocks.
 
@@ -100,9 +121,13 @@ Use labels such as `idle`, `digit 0` … `digit 9`, `hash`, `star`, `fence on`, 
 The logger's own timestamp is when the line was printed. Byte timing is the `t_us` / `+` fields.
 
 ```text
-CAP t_us=1000000 gap_us=60000 n=3 sync=1 map=off drop=0
-CAP | 80+0 FB+4400 FF+17500
-CAP repeat x40 gap_us=55000-62000 n=3 80 FB FF
+MARK: digit 4 t_us=123456789
+CAP chg map=off n=5 80 FB FF FF FF
+CAP sum st=45 poll=40 4F=6 other=0 edge_q=34 edge_hit=1 uart=ODD P=0 F=0 marks=1
+CAP sum mark: digit 4 t_us=123456789
+EDGE poll=4F t_us=123400000 n=18 mark=digit 4
+EDGE dt 4200L 4610H 5020L 5440H
+EDGE try E1=7E/bad O1=7E/ok N1=7E/bad 9=07E
 ```
 
 | Field | Meaning |
@@ -116,50 +141,49 @@ CAP repeat x40 gap_us=55000-62000 n=3 80 FB FF
 | `batch=1` | At least one byte was already queued when the loop read it |
 | `80+4583` | Byte `0x80`, then microseconds since the previous byte in the burst. The first byte is `+0` |
 | `*` | Delta under 250 µs, so the byte was sitting in the driver buffer. That number is not wire time |
-| `CAP repeat xN` | N further copies of the same bytes were counted instead of logged in full |
+| `CAP chg` | Status bytes changed. Repeated idle frames are not printed |
+| `CAP sum` | Counts for the last 5 seconds, including UART parity (`P`) and framing (`F`) errors for the parity in `uart=` |
+| `CAP sum mark` | Copy of a `MARK:` line, so a dropped immediate line is still in the file |
+| `EDGE poll` | A poll byte was followed by extra edges inside the window. `dt` values are microseconds from the UART poll byte, then `H` or `L` for the raw pad level |
+| `EDGE try` | Same edges sampled at 2400 baud. `E1` even parity, `O1` odd parity, `N1` 8 data bits plus stop, `9` nine data bits. `/ok` means the parity or stop bit matched |
 
-Bursts split after **25 ms** of idle, the same gap main uses. With the fence off, the energiser sends `80 FB FF` (about 4 ms between `80` and `FB`, then about 17 ms before `FF`). That whole frame stays one burst and maps to `off`. A single byte (`79`, `F8`, `27`, `F7`, `4F`, `FB`, `7A`, cycling) follows about 30 ms later, so it is its own burst with `map=none`. It is not required for the fence-off state.
+The energiser sends a status frame about every 110 ms, then one poll byte (`79 F8 27 F7 4F FB 7A`). The real keypad answers `4F`, starting about 8–10 ms after the poll byte starts. The edge window opens when the UART delivers that poll byte and stays open for `edge_window` (30 ms). Windows with no later edges increment `edge_q` and are not printed.
 
-Main's decoder ignored any burst shorter than 5 bytes. It still reported fence-off because a slow read often glued that later byte, and sometimes the next frame, onto `80 FB FF` before the 25 ms check ran. This build reads the gap from the wire time and accepts the 3-byte frame on its own. Communications stays on while those frames keep arriving.
+Bursts still split after **25 ms** of idle. Fence-off can be the 3-byte frame `80 FB FF` or the longer `80 FB FF FF FF`. Either maps to off when there is no `DF`. Communications stays on while those frames arrive. After 5 seconds without one, Communications turns off and the fence sensors become unavailable.
 
-At 2400 baud, 8 data bits, even parity, and 1 stop bit, one byte is 11 bit times: **4583 µs**. Bytes that follow each other on the wire land near that number. An extra idle of about 5 ms shows up as a larger `+` delta inside the same burst.
+Per-byte UART timings (`CAP t_us` / `CAP |`) are DEBUG. They are emitted for a status change and for a non-poll burst, not for every idle frame. Set `logger` `level: DEBUG` and `logs: nemtek: DEBUG` or those lines are compiled out.
 
-`map=none` is still logged. Those are the bursts the state decoder ignores.
-
-Identical bursts are coalesced when `capture_coalesce` is true. The first copy is logged in full. Further copies increment a counter, with a `CAP repeat` line at least every 5 seconds and again when the bytes change. A copy whose internal gaps differ by more than 2 ms is logged in full. Near-zero `*` deltas are ignored for that comparison.
-
-Leave `rx_full_threshold` and `rx_timeout` unset. At 2400 8E1 the ESPHome default threshold is already 1 byte, and the default timeout is 2 byte-times. Forcing timeout to 1 is not what split `80 FB FF` from the following byte (that gap is about 30 ms). The component does not change those UART settings.
-
-Capture does not collect parity or framing flags. On this bus the ESP32 even-parity checker raises a parity interrupt for every byte while still delivering the data byte. Reading that interrupt means replacing ESPHome's RX wake callback. That hook is not installed, and a parity error never discards a byte or resets the FIFO.
+`P=` and `F=` are counted from the UART error interrupt. The count is labeled with the parity actually programmed (`uart=ODD` or `uart=EVEN`). A parity error does not discard the byte and does not reset the FIFO. The RX wake callback is still invoked.
 
 ## Save the log
 
 In the ESPHome dashboard, open **Logs** and use the download control on the log window after the checklist. Copy from the `Capture ON` line through `Capture off`.
 
-From a shell, if you use the ESPHome CLI against the same YAML:
+Save from the CLI in one unbroken session. A dashboard log window dropped lines when the task buffer was 768 bytes, including a Mark.
 
 ```bash
-esphome logs examples/nemtek-merlin.yaml > nemtek-capture.log
+esphome logs nemtek-merlin.yaml > nemtek-capture.log
 ```
 
-Stop the command after `Capture off`. The redirect file is local and should be treated as secret until it is redacted.
+Leave that command running for the whole checklist. Stop it only after `Capture off`. The file is secret until it is redacted.
 
 ## Checklist
 
-Do this with the physical keypad. The ESP32 does not send keys. Arm or disarm the real fence only when it is safe for the fence to energise or drop.
+Do this with the physical keypad. The ESP32 does not send keys. Arm the fence only when that is safe. Do not type the PIN into **Nemtek Capture Mark**. Use `digit 4`, not the code.
 
-Wait about a second between steps so each action is its own gap in the log. Submit the mark, then press the key.
+Leave about 3 seconds between keys so each press has its own edge window and the log can keep up.
 
-1. Turn **Nemtek Capture** on and confirm the privacy warning.
-2. Mark `idle`. Leave the keypad alone for about 30 seconds.
-3. For each digit, mark `digit 0`, press `0`, then `digit 1`, press `1`, and so on through `digit 9`.
-4. Mark `hash`, press `#`.
-5. Mark `star`, press `*`.
-6. Mark `fence on`. Enter the full PIN and press `#` so the fence turns on.
-7. Mark `fence off`. Enter the full PIN and press `#` so the fence turns off.
-8. Mark `power`. Enter `*3#` (Merlin power mode).
-9. Mark `done`. Turn **Nemtek Capture** off.
-10. Save the log. Redact it before sending it anywhere.
+1. Start `esphome logs` into a file, as above.
+2. Turn **Nemtek Capture** on. Confirm `Capture ON` and a `CAP sum` line with `uart=ODD`.
+3. Mark `idle`. Leave the keypad alone for about 30 seconds. `edge_hit` should stay 0 if nobody presses a key.
+4. For each digit, mark `digit 0`, press `0`, wait 3 seconds, then `digit 1`, and so on through `digit 9`.
+5. Mark `hash`, press `#`, wait 3 seconds.
+6. Mark `star`, press `*`, wait 3 seconds.
+7. With the fence **on**, mark `power` and enter `*3#`. Power mode is not visible on the status frame while the fence is off.
+8. Mark `done`. Turn **Nemtek Capture** off. Stop `esphome logs`.
+9. Redact the file before sending it anywhere.
+
+Fence-on and fence-off PIN entries are optional and only when the fence is safe to arm or drop. Mark those `fence on` and `fence off`. The PIN stays on the keypad, not in the mark text.
 
 Normal fence sensors should keep updating during the capture. After the bus has been quiet for 5 seconds they become **unavailable** in Home Assistant. **Nemtek Communications** turns off. Both recover when valid `80 FB` bursts return (three matching bursts for the fence state).
 
@@ -168,21 +192,7 @@ Normal fence sensors should keep updating during the capture. After the bus has 
 Work on a copy. Keep the original somewhere private.
 
 1. Read every `MARK:` line. Replace any that contain a PIN with the action name only (`fence on`, `digit 4`).
-2. On `CAP |` lines, replace each `HH+` byte with `XX+`. On `CAP repeat` lines, replace the hex fingerprint after `n=` the same way. Leave `t_us`, `gap_us`, and the `+` timings.
-
-```text
-CAP | 80+0 FB+4583 FC+4590 FF+4610
-CAP repeat x40 gap_us=16000-19000 n=6 80 FB FC FF 11 00
-```
-
-becomes:
-
-```text
-CAP | XX+0 XX+4583 XX+4590 XX+4610
-CAP repeat x40 gap_us=16000-19000 n=6 XX XX XX XX XX XX
-```
-
-From the directory that contains the saved log:
+2. On `CAP |` lines, replace each `HH+` byte with `XX+`. On `CAP chg`, `CAP other`, and `EDGE try` lines, replace hex payload bytes with `XX`. Leave `EDGE dt` timings and `H`/`L` levels: those are the pulse record. They still describe the bits, so the redacted file is for the people analysing this bus, not for a public post.
 
 ```bash
 python3 - <<'PY'
@@ -194,19 +204,19 @@ out = []
 for line in src.read_text(errors="replace").splitlines():
     if "CAP |" in line:
         line = re.sub(r"\b[0-9A-Fa-f]{2}\+", "XX+", line)
-    elif "CAP repeat" in line:
-        head, sep, tail = line.rpartition(" n=")
-        if sep:
-            count, _, finger = tail.partition(" ")
-            finger = re.sub(r"\b[0-9A-Fa-f]{2}\b", "XX", finger)
-            line = f"{head}{sep}{count} {finger}".rstrip()
+    elif "CAP chg" in line or "CAP other" in line:
+        line = re.sub(r"\b[0-9A-Fa-f]{2}\b", "XX", line)
+    elif "EDGE try" in line:
+        line = re.sub(r"(?:=)[0-9A-Fa-f?]{2,4}", r"=XX", line)
+    elif "EDGE poll=" in line:
+        line = re.sub(r"poll=[0-9A-Fa-f]{2}", "poll=XX", line)
     out.append(line)
 dst.write_text("\n".join(out) + "\n")
 print(f"wrote {dst}")
 PY
 ```
 
-Open the redacted file and search for `CAP |` and `CAP repeat`. The only hex-looking pairs left should be inside timestamps, not payload bytes.
+`EDGE dt` lines are unchanged. Check `MARK:` lines and `CAP sum mark:` lines do not contain a PIN.
 
 3. If a reviewer needs real idle bytes, send only the `idle` section, and only after you have confirmed no digit was pressed in that window. Send `digit`, `fence on`, and `fence off` as timings only.
 4. Do not post the unredacted log on a public issue, chat, or email thread.
@@ -218,5 +228,6 @@ With the redacted log, include:
 - Energiser model (Merlin 4, single zone) and that the keypad is the original Nemtek keypad
 - ESPHome version from the dashboard
 - The checklist steps you completed, and any you skipped
-- Whether `P`, `F`, or `O` were ever non-zero
+- The `uart=` value and whether `P=` or `F=` in `CAP sum` was zero
+- Whether any `EDGE` window appeared for digit, `*`, and `#` presses
 - Whether fence on / fence off actually changed the energiser
