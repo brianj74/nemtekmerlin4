@@ -44,6 +44,12 @@ api:
 ota:
   - platform: esphome
     password: !secret ota_password
+    on_begin:
+      - lambda: id(nemtek_bus).release_line_();
+
+safe_mode:
+  on_safe_mode:
+    - lambda: id(nemtek_bus).release_line_();
 
 external_components:
   - source:
@@ -66,6 +72,7 @@ uart:
   rx_buffer_size: 256
 
 nemtek:
+  id: nemtek_bus
   uart_id: nemtek_uart
   # Applies ODD on the already-open UART without retaking the pin.
   parity: ODD
@@ -75,6 +82,32 @@ nemtek:
   edge_after: ALL
   edge_inverted: true
   capture_coalesce: true
+  # Transmit stays out of the image's active path until this is true and the
+  # Home Assistant switch is turned on. Never set a slot of 4F.
+  tx_enabled: false
+  fence_control: false
+  tx_slot: "79"
+  test_digit: 0
+  # fence_pin: !secret fence_pin
+  tx_enable:
+    name: "Nemtek Transmit Enable"
+    restore_mode: ALWAYS_OFF
+  slot:
+    name: "Nemtek Keypad Slot"
+  idle_responder:
+    name: "Nemtek Idle Responder"
+    restore_mode: ALWAYS_OFF
+  send_idle:
+    name: "Nemtek Send Idle Reply"
+  test_digit_number:
+    name: "Nemtek Test Digit"
+  send_digit:
+    name: "Nemtek Send Test Digit"
+  fence_switch:
+    name: "Nemtek Fence"
+    restore_mode: ALWAYS_OFF
+  toggle_power:
+    name: "Nemtek Toggle Power"
   capture:
     name: "Nemtek Capture"
     restore_mode: ALWAYS_OFF

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0 — 2026-11-09
+
+- Opt-in open-drain transmit on GPIO21. `tx_enabled` defaults off, and **Nemtek Transmit Enable** boots off. The pin is released on shutdown, and a 15 ms deadline releases it during a frame. Slot `4F` is refused.
+- Stage buttons send one idle reply or one test digit. An idle-responder switch answers the chosen silent slot with `FE 04 03`. Fence on/off and `*3#` stay behind `fence_control` and `!secret fence_pin`, which is never logged.
+- Keypad edge decode now uses non-inverted 8E1 (`EDGE kp`). Edge capture stays off while transmit is armed.
+
 ## 0.2.2 — 2026-11-09
 
 - Capture an input-only GPIO edge window after each poll byte and print pulse timings plus 2400 baud 8E1, 8O1, 8N1, and 9-bit decode attempts. Quiet windows are counted, not printed.

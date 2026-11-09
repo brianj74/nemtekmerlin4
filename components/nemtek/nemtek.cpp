@@ -131,6 +131,7 @@ void NemtekComponent::setup() {
   this->apply_parity_override_();
   this->install_uart_error_hook_();
   this->install_edge_isr_();
+  this->tx_boot_();
   this->parity_seen_ = g_parity_errors;
   this->frame_seen_ = g_frame_errors;
 
@@ -172,6 +173,7 @@ void NemtekComponent::loop() {
     this->log_summary_(now_ms);
     this->last_summary_ms_ = now_ms;
   }
+  this->tx_service_(micros());
 }
 
 void NemtekComponent::ingest_(uint8_t byte, uint32_t now_us) {
@@ -542,7 +544,9 @@ void NemtekComponent::install_edge_isr_() {
 }
 
 void NemtekComponent::on_uart_byte_(uint8_t byte, uint32_t now_us) {
-  if (!this->capture_enabled_ || poll_index_(byte) < 0)
+  if (poll_index_(byte) >= 0)
+    this->tx_on_poll_(byte, now_us);
+  if (!this->capture_enabled_ || this->tx_runtime_ || poll_index_(byte) < 0)
     return;
   this->poll_count_++;
   if (byte == 0x4F)
@@ -706,6 +710,64 @@ void NemtekComponent::log_edge_window_(uint8_t poll, uint32_t start_us, uint16_t
   if (bytes == 0)
     snprintf(decoded, sizeof(decoded), "EDGE try none");
   ESP_LOGI(TAG, "%s", decoded);
+
+  // Keypad replies are 8E1 with the opposite polarity: pad high is idle/1,
+  // and start/0 pull the line low. Panel decode above uses the UART inversion.
+  char kp[96];
+  size_t kused = static_cast<size_t>(snprintf(kp, sizeof(kp), "EDGE kp"));
+  int kp_bytes = 0;
+  uint16_t kp_i = 0;
+  while (kp_i < n && kp_bytes < 4 && kused + 8 < sizeof(kp)) {
+    const uint32_t origin = sample[kp_i].t_us;
+    auto bit_is_one = [&](int bit, bool *one) -> bool {
+      const uint32_t at = origin + static_cast<uint32_t>((2 * bit + 1) * 1000000ULL / 4800ULL);
+      uint8_t level = 0;
+      if (!level_at(at, &level))
+        return false;
+      *one = level != 0;
+      return true;
+    };
+    bool start_one = false;
+    if (!bit_is_one(0, &start_one) || start_one) {
+      kp_i++;
+      continue;
+    }
+    uint8_t data = 0;
+    bool ok = true;
+    for (int bit = 0; bit < 8; bit++) {
+      bool one = false;
+      if (!bit_is_one(bit + 1, &one)) {
+        ok = false;
+        break;
+      }
+      if (one)
+        data = static_cast<uint8_t>(data | (1u << bit));
+    }
+    bool parity = false;
+    bool stop = false;
+    uint8_t x = 0;
+    for (int bit = 0; bit < 8; bit++)
+      x = static_cast<uint8_t>(x ^ ((data >> bit) & 1));
+    const bool parity_ok = ok && bit_is_one(9, &parity) && bit_is_one(10, &stop) && stop && (parity == (x != 0));
+    if (!ok) {
+      kp_i++;
+      continue;
+    }
+    const int wrote = snprintf(kp + kused, sizeof(kp) - kused, " %02X%s", data, parity_ok ? "" : "?");
+    if (wrote > 0)
+      kused += static_cast<size_t>(wrote);
+    kp_bytes++;
+    const uint32_t next = origin + static_cast<uint32_t>(11 * 1000000ULL / 2400ULL);
+    uint16_t nxt = static_cast<uint16_t>(kp_i + 1);
+    while (nxt < n && sample[nxt].t_us < next)
+      nxt++;
+    if (nxt == kp_i)
+      break;
+    kp_i = nxt;
+  }
+  if (kp_bytes == 0)
+    snprintf(kp, sizeof(kp), "EDGE kp none");
+  ESP_LOGI(TAG, "%s", kp);
 #else
   (void) poll;
   (void) start_us;

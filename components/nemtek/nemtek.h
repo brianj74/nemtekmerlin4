@@ -6,6 +6,9 @@
 #include <vector>
 
 #include "esphome/components/binary_sensor/binary_sensor.h"
+#include "esphome/components/button/button.h"
+#include "esphome/components/number/number.h"
+#include "esphome/components/select/select.h"
 #include "esphome/components/switch/switch.h"
 #include "esphome/components/text/text.h"
 #include "esphome/components/uart/uart.h"
@@ -38,15 +41,99 @@ class NemtekMarkText : public text::Text {
   NemtekComponent *parent_{nullptr};
 };
 
+class NemtekTxEnableSwitch : public switch_::Switch {
+ public:
+  void set_parent(NemtekComponent *parent) { this->parent_ = parent; }
+
+ protected:
+  void write_state(bool state) override;
+  NemtekComponent *parent_{nullptr};
+};
+
+class NemtekIdleSwitch : public switch_::Switch {
+ public:
+  void set_parent(NemtekComponent *parent) { this->parent_ = parent; }
+
+ protected:
+  void write_state(bool state) override;
+  NemtekComponent *parent_{nullptr};
+};
+
+class NemtekFenceSwitch : public switch_::Switch {
+ public:
+  void set_parent(NemtekComponent *parent) { this->parent_ = parent; }
+
+ protected:
+  void write_state(bool state) override;
+  NemtekComponent *parent_{nullptr};
+};
+
+class NemtekSlotSelect : public select::Select {
+ public:
+  void set_parent(NemtekComponent *parent) { this->parent_ = parent; }
+
+ protected:
+  void control(const std::string &value) override;
+  NemtekComponent *parent_{nullptr};
+};
+
+class NemtekDigitNumber : public number::Number {
+ public:
+  void set_parent(NemtekComponent *parent) { this->parent_ = parent; }
+
+ protected:
+  void control(float value) override;
+  NemtekComponent *parent_{nullptr};
+};
+
+class NemtekIdleButton : public button::Button {
+ public:
+  void set_parent(NemtekComponent *parent) { this->parent_ = parent; }
+
+ protected:
+  void press_action() override;
+  NemtekComponent *parent_{nullptr};
+};
+
+class NemtekDigitButton : public button::Button {
+ public:
+  void set_parent(NemtekComponent *parent) { this->parent_ = parent; }
+
+ protected:
+  void press_action() override;
+  NemtekComponent *parent_{nullptr};
+};
+
+class NemtekPowerButton : public button::Button {
+ public:
+  void set_parent(NemtekComponent *parent) { this->parent_ = parent; }
+
+ protected:
+  void press_action() override;
+  NemtekComponent *parent_{nullptr};
+};
+
 class NemtekComponent : public Component, public uart::UARTDevice {
  public:
   void setup() override;
   void loop() override;
   void dump_config() override;
+  void on_shutdown() override;
   float get_setup_priority() const override { return setup_priority::DATA; }
+
+  void set_tx_compiled(bool enabled) { this->tx_compiled_ = enabled; }
+  void set_fence_control_compiled(bool enabled) { this->fence_control_compiled_ = enabled; }
+  void set_default_slot(uint8_t slot) { this->tx_slot_ = slot; }
+  void set_default_test_digit(uint8_t digit) { this->test_digit_ = digit; }
+  void set_fence_pin(const char *pin);
 
   void set_capture_switch(NemtekCaptureSwitch *capture_switch) { this->capture_switch_ = capture_switch; }
   void set_mark_text(NemtekMarkText *mark_text) { this->mark_text_ = mark_text; }
+  void set_tx_enable_switch(NemtekTxEnableSwitch *sw) { this->tx_enable_switch_ = sw; }
+  void set_idle_switch(NemtekIdleSwitch *sw) { this->idle_switch_ = sw; }
+  void set_fence_switch(NemtekFenceSwitch *sw) { this->fence_switch_ = sw; }
+  void set_slot_select(NemtekSlotSelect *sel) { this->slot_select_ = sel; }
+  void set_digit_number(NemtekDigitNumber *num) { this->digit_number_ = num; }
   void set_capture_coalesce(bool coalesce) { this->capture_coalesce_ = coalesce; }
   void set_parity_odd(bool odd) {
     this->parity_override_ = true;
@@ -63,6 +150,17 @@ class NemtekComponent : public Component, public uart::UARTDevice {
   void set_capture_enabled(bool enabled);
   // Insert a capture annotation. Empty labels are ignored.
   void mark(const std::string &label);
+
+  void set_tx_enabled(bool enabled);
+  void set_idle_responder(bool enabled);
+  void set_tx_slot_name(const char *name);
+  void set_test_digit(uint8_t digit) { this->test_digit_ = digit; }
+  void request_idle_once();
+  void request_test_digit();
+  void request_fence(bool on);
+  void request_power_toggle();
+  void release_line_();
+  void tx_boot_();
 
 #define NEMTEK_SETTER(name) \
   void set_##name##_sensor(binary_sensor::BinarySensor *sensor) { this->name##_sensor_ = sensor; }
@@ -122,6 +220,13 @@ class NemtekComponent : public Component, public uart::UARTDevice {
   const char *map_token_(MerlinState state) const;
 
   void on_uart_byte_(uint8_t byte, uint32_t now_us);
+  void tx_on_poll_(uint8_t poll, uint32_t now_us);
+  void tx_service_(uint32_t now_us);
+  bool tx_send_(const uint8_t *bytes, uint8_t len, const char *what);
+  bool tx_rate_ok_();
+  void tx_note_attempt_();
+  void tx_queue_key_(uint8_t key, bool masked);
+  void tx_finish_command_(bool ok, const char *why);
   void service_edge_window_(bool force);
   void log_edge_window_(uint8_t poll, uint32_t start_us, uint16_t count);
   void log_summary_(uint32_t now_ms);
@@ -210,6 +315,41 @@ class NemtekComponent : public Component, public uart::UARTDevice {
 
   NemtekCaptureSwitch *capture_switch_{nullptr};
   NemtekMarkText *mark_text_{nullptr};
+  NemtekTxEnableSwitch *tx_enable_switch_{nullptr};
+  NemtekIdleSwitch *idle_switch_{nullptr};
+  NemtekFenceSwitch *fence_switch_{nullptr};
+  NemtekSlotSelect *slot_select_{nullptr};
+  NemtekDigitNumber *digit_number_{nullptr};
+
+  bool tx_compiled_{false};
+  bool fence_control_compiled_{false};
+  bool tx_runtime_{false};
+  bool tx_fault_{false};
+  bool idle_responder_{false};
+  bool one_shot_idle_{false};
+  bool need_idle_ack_{false};
+  bool tx_armed_{false};
+  bool awaiting_confirm_{false};
+  bool confirm_any_change_{false};
+  uint8_t tx_slot_{0x79};
+  uint8_t test_digit_{0};
+  uint8_t key_q_[12]{};
+  bool key_masked_[12]{};
+  uint8_t key_q_len_{0};
+  uint8_t cmd_{0};
+  bool retrying_{false};
+  uint8_t fence_pin_[9]{};
+  uint8_t fence_pin_len_{0};
+  uint8_t retries_left_{0};
+  MerlinState confirm_from_{MerlinState::UNKNOWN};
+  bool confirm_want_on_{false};
+  uint32_t confirm_deadline_ms_{0};
+  uint32_t tx_due_us_{0};
+  uint32_t tx_poll_us_{0};
+  uint32_t tx_watch_until_ms_{0};
+  uint32_t attempt_ms_[3]{};
+  uint8_t attempt_n_{0};
+  char tx_line_pin_{0};
 
 #define NEMTEK_SENSOR(name) binary_sensor::BinarySensor *name##_sensor_{nullptr};
   NEMTEK_SENSOR(hv_good)

@@ -145,7 +145,8 @@ EDGE try E1=7E/bad O1=7E/ok N1=7E/bad 9=07E
 | `CAP sum` | Counts for the last 5 seconds, including UART parity (`P`) and framing (`F`) errors for the parity in `uart=` |
 | `CAP sum mark` | Copy of a `MARK:` line, so a dropped immediate line is still in the file |
 | `EDGE poll` | A poll byte was followed by extra edges inside the window. `dt` values are microseconds from the UART poll byte, then `H` or `L` for the raw pad level |
-| `EDGE try` | Same edges sampled at 2400 baud. `E1` even parity, `O1` odd parity, `N1` 8 data bits plus stop, `9` nine data bits. `/ok` means the parity or stop bit matched |
+| `EDGE try` | Panel polarity (inverted, matching the UART). `E1` / `O1` / `N1` / `9` |
+| `EDGE kp` | Keypad polarity: pad high is 1, start and 0 are low, 8E1. A real reply looks like `FE 04 03` or `FE 06` plus a key byte |
 
 The energiser sends a status frame about every 110 ms, then one poll byte (`79 F8 27 F7 4F FB 7A`). The real keypad answers `4F`, starting about 8–10 ms after the poll byte starts. The edge window opens when the UART delivers that poll byte and stays open for `edge_window` (30 ms). Windows with no later edges increment `edge_q` and are not printed.
 

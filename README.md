@@ -45,6 +45,8 @@ An optional Home Assistant switch, **Nemtek Capture**, logs every received burst
 
 How to OTA-flash this branch, run a keypad checklist, and redact a log: [docs/capture.md](docs/capture.md).
 
+Opt-in keypad transmit is off unless `tx_enabled: true`. The test stages are in [docs/transmit.md](docs/transmit.md).
+
 ## Installation
 
 Dashboard OTA using this branch is documented in [docs/capture.md](docs/capture.md). The example YAML is [examples/nemtek-merlin.yaml](examples/nemtek-merlin.yaml). Sensor keys belong directly under `nemtek:`.
