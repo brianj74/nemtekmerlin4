@@ -88,6 +88,11 @@ nemtek:
   fence_control: false
   tx_slot: "79"
   test_digit: 0
+  # Optional. Defaults already match a keypad: 2.9 ms after the poll stop bit,
+  # accepted from 2.5 ms to 5.0 ms. Existing YAML does not need these keys.
+  # tx_reply: 2900us
+  # tx_reply_min: 2500us
+  # tx_reply_max: 5000us
   # fence_pin: !secret fence_pin
   tx_enable:
     name: "Nemtek Transmit Enable"

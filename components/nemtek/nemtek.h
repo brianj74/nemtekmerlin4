@@ -13,9 +13,19 @@
 #include "esphome/components/text/text.h"
 #include "esphome/components/uart/uart.h"
 #include "esphome/core/component.h"
+#ifdef USE_ESP32
+#include <esp_attr.h>
+#endif
 
 namespace esphome {
 namespace nemtek {
+
+bool nemtek_tx_listening();
+#ifdef USE_ESP32
+void IRAM_ATTR nemtek_tx_on_edge(uint32_t now_us, uint8_t level);
+#else
+void nemtek_tx_on_edge(uint32_t now_us, uint8_t level);
+#endif
 
 class NemtekComponent;
 
@@ -125,6 +135,9 @@ class NemtekComponent : public Component, public uart::UARTDevice {
   void set_fence_control_compiled(bool enabled) { this->fence_control_compiled_ = enabled; }
   void set_default_slot(uint8_t slot) { this->tx_slot_ = slot; }
   void set_default_test_digit(uint8_t digit) { this->test_digit_ = digit; }
+  void set_tx_reply_us(uint32_t us) { this->tx_reply_us_ = us; }
+  void set_tx_reply_min_us(uint32_t us) { this->tx_reply_min_us_ = us; }
+  void set_tx_reply_max_us(uint32_t us) { this->tx_reply_max_us_ = us; }
   void set_fence_pin(const char *pin);
 
   void set_capture_switch(NemtekCaptureSwitch *capture_switch) { this->capture_switch_ = capture_switch; }
@@ -222,6 +235,13 @@ class NemtekComponent : public Component, public uart::UARTDevice {
   void on_uart_byte_(uint8_t byte, uint32_t now_us);
   void tx_on_poll_(uint8_t poll, uint32_t now_us);
   void tx_service_(uint32_t now_us);
+  void tx_on_edge_byte_(uint32_t start_us);
+  void tx_fire_(uint32_t stop_us);
+  friend void tx_byte_timer_cb(void *);
+  friend void tx_reply_timer_cb(void *);
+  void tx_note_skip_(uint32_t latency_us, const char *why);
+  void tx_flush_skips_(uint32_t now_ms);
+  bool tx_want_() const;
   bool tx_send_(const uint8_t *bytes, uint8_t len, const char *what);
   bool tx_rate_ok_();
   void tx_note_attempt_();
@@ -347,6 +367,17 @@ class NemtekComponent : public Component, public uart::UARTDevice {
   uint32_t tx_due_us_{0};
   uint32_t tx_poll_us_{0};
   uint32_t tx_watch_until_ms_{0};
+  uint32_t tx_reply_us_{2900};
+  uint32_t tx_reply_min_us_{2500};
+  uint32_t tx_reply_max_us_{5000};
+  uint32_t tx_stop_us_{0};
+  const char *tx_skip_why_{nullptr};
+  uint32_t tx_skip_n_{0};
+  uint32_t tx_skip_min_us_{0};
+  uint32_t tx_skip_max_us_{0};
+  uint32_t tx_slot_seen_{0};
+  uint32_t tx_stat_ms_{0};
+  uint32_t tx_edge_sched_us_{0};
   uint32_t attempt_ms_[3]{};
   uint8_t attempt_n_{0};
   char tx_line_pin_{0};

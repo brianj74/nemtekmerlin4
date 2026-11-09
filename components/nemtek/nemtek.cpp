@@ -45,9 +45,12 @@ static EdgeIsrState g_edge{};
 
 static void IRAM_ATTR nemtek_edge_isr(void *arg) {
   (void) arg;
+  const uint32_t now = static_cast<uint32_t>(esp_timer_get_time());
+  const uint8_t level = static_cast<uint8_t>(gpio_get_level(static_cast<gpio_num_t>(g_edge.pin)));
+  if (nemtek_tx_listening())
+    nemtek_tx_on_edge(now, level);
   if (g_edge.open == 0)
     return;
-  const uint32_t now = static_cast<uint32_t>(esp_timer_get_time());
   if (static_cast<int32_t>(now - g_edge.end_us) >= 0) {
     g_edge.open = 0;
     return;
@@ -56,7 +59,7 @@ static void IRAM_ATTR nemtek_edge_isr(void *arg) {
   if (n >= kEdgeMax)
     return;
   g_edge.t_us[n] = now;
-  g_edge.level[n] = static_cast<uint8_t>(gpio_get_level(static_cast<gpio_num_t>(g_edge.pin)));
+  g_edge.level[n] = level;
   g_edge.count = static_cast<uint16_t>(n + 1);
 }
 
@@ -419,7 +422,7 @@ void NemtekComponent::set_capture_enabled(bool enabled) {
              "Capture ON. Logs may contain keypad PIN digits. Keep logs private and redact them before sharing.");
   } else {
 #ifdef USE_ESP32
-    if (this->edge_isr_ok_)
+    if (this->edge_isr_ok_ && !this->tx_runtime_)
       gpio_intr_disable(static_cast<gpio_num_t>(this->edge_pin_));
 #endif
     ESP_LOGI(TAG, "Capture off");

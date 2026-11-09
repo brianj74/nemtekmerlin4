@@ -78,6 +78,9 @@ schema[cv.Optional("tx_enabled", default=False)] = cv.boolean
 schema[cv.Optional("fence_control", default=False)] = cv.boolean
 schema[cv.Optional("tx_slot", default="79")] = cv.one_of(*SLOT_OPTIONS, upper=True)
 schema[cv.Optional("test_digit", default=0)] = cv.int_range(min=0, max=9)
+schema[cv.Optional("tx_reply", default="2900us")] = cv.positive_time_period_microseconds
+schema[cv.Optional("tx_reply_min", default="2500us")] = cv.positive_time_period_microseconds
+schema[cv.Optional("tx_reply_max", default="5000us")] = cv.positive_time_period_microseconds
 schema[cv.Optional("fence_pin")] = cv.string_strict
 schema[cv.Optional("tx_enable")] = switch.switch_schema(
     NemtekTxEnableSwitch,
@@ -149,6 +152,9 @@ async def to_code(config):
     slot = int(config["tx_slot"], 16)
     cg.add(var.set_default_slot(slot))
     cg.add(var.set_default_test_digit(config["test_digit"]))
+    cg.add(var.set_tx_reply_us(config["tx_reply"].total_microseconds))
+    cg.add(var.set_tx_reply_min_us(config["tx_reply_min"].total_microseconds))
+    cg.add(var.set_tx_reply_max_us(config["tx_reply_max"].total_microseconds))
     if "fence_pin" in config:
         cg.add(var.set_fence_pin(config["fence_pin"]))
     if "parity" in config:

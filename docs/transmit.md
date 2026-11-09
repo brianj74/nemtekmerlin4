@@ -44,6 +44,10 @@ nemtek:
   fence_control: false
   tx_slot: "79"
   test_digit: 0
+  # Reply start measured from the poll stop bit. Defaults match a real keypad.
+  # tx_reply: 2900us
+  # tx_reply_min: 2500us
+  # tx_reply_max: 5000us
   tx_enable:
     name: "Nemtek Transmit Enable"
   slot:
@@ -80,7 +84,7 @@ fence_pin: !secret fence_pin
 3. Pick slot `79` (or another silent poll, not `4F`).
 4. Turn **Nemtek Transmit Enable** on. Expect `Transmit on, slot 79, open-drain released`.
 5. Press **Nemtek Send Idle Reply** once.
-6. Look for `TX sent idle slot=79`. Then for 3 seconds look for `TX ack repoll slot=79`. A re-poll means the panel treated the slot like a keypad. No re-poll means this slot was ignored. The status frame should stay whatever it was.
+6. Look for `TX sent idle slot=79 latency=2.9ms readback=ok`. The latency is measured from the poll stop bit, seen by the GPIO edge interrupt, and the reply is started by a hardware timer rather than the main loop. A value outside 2.5–5.0 ms is counted instead of sent, and every 5 seconds you get `TX skip xN latency min-max` or `TX wait: slot 79 not seen`. Then for 3 seconds look for `TX ack repoll slot=79`. A re-poll means the panel treated the slot like a keypad. No re-poll means this slot was ignored. The status frame should stay whatever it was.
 7. If the log says `read-back` or `watchdog`, the line was released and transmit is off. Stop and check the MOSFET board before trying again.
 8. Turn Transmit Enable off before the next stage.
 
