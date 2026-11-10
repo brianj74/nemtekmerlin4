@@ -19,6 +19,8 @@ namespace nemtek {
 
 static const char *const TAG_TX = "nemtek";
 
+static bool tx_covers_seven_(const uint8_t *polls, int n);
+
 static constexpr int32_t TX_HOLD_LIMIT_US = 15000;
 
 #ifdef USE_ESP32
@@ -26,6 +28,7 @@ static volatile uint8_t g_tx_abort = 0;
 static volatile uint8_t s_listen = 0;
 static volatile uint8_t s_last_level = 0;
 static volatile uint32_t s_start_us = 0;
+static uint32_t s_last_good_start_ = 0;
 static esp_timer_handle_t s_byte_timer = nullptr;
 static esp_timer_handle_t s_reply_timer = nullptr;
 static NemtekComponent *s_owner = nullptr;
@@ -340,7 +343,13 @@ void NemtekComponent::set_tx_enabled(bool enabled) {
   if (this->edge_isr_ok_)
     gpio_intr_enable(pin);
   this->tx_base_left_ = 14;
-  this->tx_base_text_[0] = '\0';
+  this->tx_post_on_ = false;
+  this->tx_post_n_ = 0;
+  this->tx_ack_left_ = 0;
+  s_last_good_start_ = 0;
+  static const uint8_t kSelf[8] = {0x79, 0xF8, 0x27, 0xF7, 0x4F, 0xFB, 0x7A, 0x79};
+  if (!tx_covers_seven_(kSelf, 8))
+    ESP_LOGE(TAG_TX, "TX baseline check: self-test failed");
   const int level = gpio_get_level(pin);
   ESP_LOGW(TAG_TX,
            "Transmit on, slot %02X, input+pull-up level=%d. Output stays off until a reply. "
@@ -490,41 +499,81 @@ void NemtekComponent::tx_flush_skips_(uint32_t now_ms) {
   this->tx_stat_ms_ = now_ms;
 }
 
-bool NemtekComponent::tx_lone_poll_(uint8_t poll) const {
-  // Status is "80 FB ...". FB there is the second byte of the burst. A poll is
-  // the single byte after that burst (gap > 25 ms), about 55 ms into the frame.
-  return this->burst_len_ == 1 && this->burst_[0] == poll;
-}
-
-static void tx_append_token_(char *buf, size_t cap, uint8_t poll, bool ours) {
-  const size_t used = strlen(buf);
-  if (used + 6 >= cap)
-    return;
-  snprintf(buf + used, cap - used, "%s%02X%s", used != 0 ? " " : "", poll, ours ? "*" : "");
-}
-
-void NemtekComponent::tx_record_poll_(uint8_t poll) {
-  if (this->tx_base_left_ > 0) {
-    tx_append_token_(this->tx_base_text_, sizeof(this->tx_base_text_), poll, poll == this->tx_slot_);
-    if (--this->tx_base_left_ == 0)
-      ESP_LOGI(TAG_TX, "TX baseline polls: %s", this->tx_base_text_);
+static bool tx_is_poll_addr_(uint8_t byte) {
+  switch (byte) {
+    case 0x79:
+    case 0xF8:
+    case 0x27:
+    case 0xF7:
+    case 0x4F:
+    case 0xFB:
+    case 0x7A:
+      return true;
+    default:
+      return false;
   }
-  if (this->tx_post_left_ > 0) {
-    tx_append_token_(this->tx_post_text_, sizeof(this->tx_post_text_), poll, poll == this->tx_slot_);
-    if (--this->tx_post_left_ == 0)
-      ESP_LOGI(TAG_TX, "TX post-send polls slot=%02X: %s", this->tx_slot_, this->tx_post_text_);
+}
+
+static bool tx_covers_seven_(const uint8_t *polls, int n) {
+  static const uint8_t kSlots[] = {0x79, 0xF8, 0x27, 0xF7, 0x4F, 0xFB, 0x7A};
+  for (uint8_t slot : kSlots) {
+    bool found = false;
+    for (int i = 0; i < n; i++) {
+      if (polls[i] == slot)
+        found = true;
+    }
+    if (!found)
+      return false;
+  }
+  return true;
+}
+
+void NemtekComponent::tx_log_polls_(const char *label, const uint8_t *polls, int n) {
+  char buf[96];
+  size_t used = 0;
+  buf[0] = '\0';
+  for (int i = 0; i < n && used + 6 < sizeof(buf); i++) {
+    const int wrote = snprintf(buf + used, sizeof(buf) - used, "%s%02X%s", used != 0 ? " " : "", polls[i],
+                               polls[i] == this->tx_slot_ ? "*" : "");
+    if (wrote > 0)
+      used += static_cast<size_t>(wrote);
+  }
+  ESP_LOGI(TAG_TX, "%s %s", label, buf);
+}
+
+void NemtekComponent::tx_note_edge_poll_(uint8_t poll) {
+  if (this->tx_base_left_ > 0) {
+    this->tx_base_bytes_[14 - this->tx_base_left_] = poll;
+    if (--this->tx_base_left_ == 0) {
+      char label[48];
+      snprintf(label, sizeof(label), "TX baseline polls:");
+      this->tx_log_polls_(label, this->tx_base_bytes_, 14);
+      if (tx_covers_seven_(this->tx_base_bytes_, 14))
+        ESP_LOGI(TAG_TX, "TX baseline check: all 7 slots present");
+      else
+        ESP_LOGW(TAG_TX, "TX baseline check: missing a slot in %s", label);
+    }
+  }
+  if (this->tx_ack_left_ > 0) {
+    const bool hit = poll == this->tx_slot_;
+    this->tx_ack_left_--;
+    if (hit) {
+      ESP_LOGI(TAG_TX, "TX ack repoll slot=%02X", poll);
+      this->tx_ack_left_ = 0;
+    }
+  }
+  if (this->tx_post_on_ && this->tx_post_n_ < 14) {
+    this->tx_post_bytes_[this->tx_post_n_++] = poll;
+    if (this->tx_post_n_ == 14) {
+      char label[48];
+      snprintf(label, sizeof(label), "TX post-send polls slot=%02X:", this->tx_slot_);
+      this->tx_log_polls_(label, this->tx_post_bytes_, 14);
+      this->tx_post_on_ = false;
+    }
   }
 }
 
 void NemtekComponent::tx_on_poll_(uint8_t poll, uint32_t now_us) {
-  if (this->tx_lone_poll_(poll)) {
-    this->tx_record_poll_(poll);
-    if (this->tx_watch_until_ms_ != 0 && poll == this->tx_slot_ &&
-        static_cast<int32_t>(millis() - this->tx_watch_until_ms_) < 0) {
-      ESP_LOGI(TAG_TX, "TX ack repoll slot=%02X", poll);
-      this->tx_watch_until_ms_ = 0;
-    }
-  }
   if (!this->tx_runtime_ || this->tx_fault_ || poll == 0x4F || poll != this->tx_slot_)
     return;
   this->tx_slot_seen_++;
@@ -620,9 +669,9 @@ bool NemtekComponent::tx_send_(const uint8_t *bytes, uint8_t len, const char *wh
   ESP_LOGI(TAG_TX, "TX sent %s slot=%02X latency=%lu.%lums readback=ok level-before=%u", what, this->tx_slot_,
            static_cast<unsigned long>(latency / 1000), static_cast<unsigned long>((latency % 1000) / 100),
            static_cast<unsigned>(s_level_before));
-  this->tx_watch_until_ms_ = millis() + 3000;
-  this->tx_post_left_ = 14;
-  this->tx_post_text_[0] = '\0';
+  this->tx_post_on_ = true;
+  this->tx_post_n_ = 0;
+  this->tx_ack_left_ = 3;
   s_busy = 0;
   return true;
 #endif
@@ -736,7 +785,16 @@ void NemtekComponent::tx_on_edge_byte_(uint32_t start_us) {
   const uint32_t parity_at = start_us + static_cast<uint32_t>((2 * 9 + 1) * 1000000ULL / 4800ULL);
   const bool parity_one = level_at(parity_at) == 0;
   const bool odd_ok = parity_one == (ones == 0);
-  if (!odd_ok || data == 0x4F || data != this->tx_slot_ || !this->tx_runtime_ || this->tx_fault_)
+  if (!odd_ok)
+    return;
+  // Status bytes are one byte-time apart. The poll follows the last status
+  // byte by ~23 ms, so a poll-address byte after a >12 ms gap is the poll,
+  // including those the 25 ms UART split glues into the status burst.
+  const uint32_t gap = s_last_good_start_ == 0 ? 100000 : static_cast<uint32_t>(start_us - s_last_good_start_);
+  s_last_good_start_ = start_us;
+  if (tx_is_poll_addr_(data) && gap > 12000)
+    this->tx_note_edge_poll_(data);
+  if (data == 0x4F || data != this->tx_slot_ || !this->tx_runtime_ || this->tx_fault_)
     return;
   this->tx_slot_seen_++;
   if (!this->tx_want_())

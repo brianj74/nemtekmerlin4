@@ -236,8 +236,8 @@ class NemtekComponent : public Component, public uart::UARTDevice {
 
   void on_uart_byte_(uint8_t byte, uint32_t now_us);
   void tx_on_poll_(uint8_t poll, uint32_t now_us);
-  bool tx_lone_poll_(uint8_t poll) const;
-  void tx_record_poll_(uint8_t poll);
+  void tx_note_edge_poll_(uint8_t poll);
+  void tx_log_polls_(const char *label, const uint8_t *polls, int n);
   void tx_service_(uint32_t now_us);
   void tx_on_edge_byte_(uint32_t start_us);
   void tx_fire_(uint32_t stop_us);
@@ -394,10 +394,12 @@ class NemtekComponent : public Component, public uart::UARTDevice {
   uint32_t tx_glue_n_{0};
   uint32_t tx_glue_min_us_{0};
   uint32_t tx_glue_max_us_{0};
-  char tx_post_text_[96]{};
-  uint8_t tx_post_left_{0};
-  char tx_base_text_[96]{};
+  uint8_t tx_base_bytes_[14]{};
   uint8_t tx_base_left_{0};
+  uint8_t tx_post_bytes_[14]{};
+  uint8_t tx_post_n_{0};
+  bool tx_post_on_{false};
+  uint8_t tx_ack_left_{0};
   uint32_t tx_extra_stop_us_{0};
   uint32_t tx_extra_at_us_{0};
   int32_t tx_extra_dt_{0};
