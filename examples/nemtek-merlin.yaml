@@ -1,7 +1,61 @@
+# Complete reference config for a classic ESP32.
+# Receive only: DAT is GPIO21 RX. Do not add tx_pin.
+#
+# Already have this device in the ESPHome dashboard? Keep your existing
+# esphome:, esp32:, wifi:, api:, and ota: blocks. Copy the
+# external_components:, uart:, and nemtek: blocks from here.
+# Sensor keys sit directly under nemtek:, alongside capture: and mark:.
+#
+# secrets.yaml next to this file:
+#   wifi_ssid: "..."
+#   wifi_password: "..."
+#   api_encryption_key: "..."   # 32-byte base64 key from the ESPHome wizard
+#   ota_password: "..."
+
+esphome:
+  name: nemtek-merlin
+  friendly_name: Nemtek Merlin
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  # DEBUG is required so nemtek byte timings are compiled in. Idle frames are
+  # not printed; only changes, keypad edge windows, marks, and a 5 s summary.
+  level: DEBUG
+  task_log_buffer_size: 4096
+  logs:
+    nemtek: DEBUG
+    wifi: INFO
+    api: INFO
+    uart: INFO
+    mdns: INFO
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+    on_begin:
+      - lambda: id(nemtek_bus).release_line_();
+
+safe_mode:
+  on_safe_mode:
+    - lambda: id(nemtek_bus).release_line_();
+
 external_components:
   - source:
       type: git
       url: https://github.com/brianj74/nemtekmerlin4
+      ref: cursor/nemtek-capture-d374
     components: [nemtek]
 
 uart:
@@ -11,29 +65,79 @@ uart:
     inverted: true
   baud_rate: 2400
   data_bits: 8
-  parity: EVEN
+  # ODD: an earlier capture flagged even-parity on every byte, including 80 and FF.
+  # Change to EVEN to compare the P= count in the CAP sum line.
+  parity: ODD
   stop_bits: 1
+  rx_buffer_size: 256
 
 nemtek:
+  id: nemtek_bus
   uart_id: nemtek_uart
-  binary_sensor:
-    communications:
-      name: "Nemtek Communications"
-    fence_off:
-      name: "Nemtek Fence Off"
-    fence_low_power:
-      name: "Nemtek Low Power"
-    fence_volts_low:
-      name: "Nemtek Voltage Low"
-    fence_alarm_volts:
-      name: "Nemtek Alarm Voltage"
-    alarm_active:
-      name: "Nemtek Alarm"
-    hv_good:
-      name: "Nemtek HV Good"
-    hv_check:
-      name: "Nemtek HV Check"
-    hv_bad:
-      name: "Nemtek HV Bad"
-    buzzer_active:
-      name: "Nemtek Buzzer"
+  # Applies ODD on the already-open UART without retaking the pin.
+  parity: ODD
+  # GPIO21 stays the UART RX pad. This only arms an input edge interrupt.
+  edge_pin: 21
+  edge_window: 30ms
+  edge_after: ALL
+  edge_inverted: true
+  capture_coalesce: true
+  # Transmit stays out of the image's active path until this is true and the
+  # Home Assistant switch is turned on. Never set a slot of 4F.
+  tx_enabled: false
+  fence_control: false
+  tx_slot: "79"
+  test_digit: 0
+  # Optional. Defaults already match a keypad: 2.9 ms after the poll stop bit,
+  # accepted from 2.5 ms to 5.0 ms. Existing YAML does not need these keys.
+  # tx_reply: 2900us
+  # tx_reply_min: 2500us
+  # tx_reply_max: 5000us
+  # fence_pin: !secret fence_pin
+  tx_enable:
+    name: "Nemtek Transmit Enable"
+    restore_mode: ALWAYS_OFF
+  slot:
+    name: "Nemtek Keypad Slot"
+  idle_responder:
+    name: "Nemtek Idle Responder"
+    restore_mode: ALWAYS_OFF
+  send_idle:
+    name: "Nemtek Send Idle Reply"
+  test_digit_number:
+    name: "Nemtek Test Digit"
+  send_digit:
+    name: "Nemtek Send Test Digit"
+  fence_switch:
+    name: "Nemtek Fence"
+    restore_mode: ALWAYS_OFF
+  toggle_power:
+    name: "Nemtek Toggle Power"
+  capture:
+    name: "Nemtek Capture"
+    restore_mode: ALWAYS_OFF
+    entity_category: config
+  mark:
+    name: "Nemtek Capture Mark"
+    mode: TEXT
+    entity_category: config
+  communications:
+    name: "Nemtek Communications"
+  fence_off:
+    name: "Nemtek Fence Off"
+  fence_low_power:
+    name: "Nemtek Low Power"
+  fence_volts_low:
+    name: "Nemtek Voltage Low"
+  fence_alarm_volts:
+    name: "Nemtek Alarm Voltage"
+  alarm_active:
+    name: "Nemtek Alarm"
+  hv_good:
+    name: "Nemtek HV Good"
+  hv_check:
+    name: "Nemtek HV Check"
+  hv_bad:
+    name: "Nemtek HV Bad"
+  buzzer_active:
+    name: "Nemtek Buzzer"
