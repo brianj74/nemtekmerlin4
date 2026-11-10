@@ -339,6 +339,8 @@ void NemtekComponent::set_tx_enabled(bool enabled) {
   s_listen = 1;
   if (this->edge_isr_ok_)
     gpio_intr_enable(pin);
+  this->tx_base_left_ = 14;
+  this->tx_base_text_[0] = '\0';
   const int level = gpio_get_level(pin);
   ESP_LOGW(TAG_TX,
            "Transmit on, slot %02X, input+pull-up level=%d. Output stays off until a reply. "
@@ -488,20 +490,40 @@ void NemtekComponent::tx_flush_skips_(uint32_t now_ms) {
   this->tx_stat_ms_ = now_ms;
 }
 
-void NemtekComponent::tx_on_poll_(uint8_t poll, uint32_t now_us) {
-  if (this->tx_post_left_ > 0 && this->tx_post_n_ < 10) {
-    this->tx_post_pattern_[this->tx_post_n_++] = poll == this->tx_slot_ ? '1' : '0';
-    this->tx_post_left_--;
-    if (this->tx_post_left_ == 0) {
-      this->tx_post_pattern_[this->tx_post_n_] = '\0';
-      ESP_LOGI(TAG_TX, "TX post-send polls slot=%02X: %s (1 = our slot; a normal cycle has one 1 per 7 polls)",
-               this->tx_slot_, this->tx_post_pattern_);
-    }
+bool NemtekComponent::tx_lone_poll_(uint8_t poll) const {
+  // Status is "80 FB ...". FB there is the second byte of the burst. A poll is
+  // the single byte after that burst (gap > 25 ms), about 55 ms into the frame.
+  return this->burst_len_ == 1 && this->burst_[0] == poll;
+}
+
+static void tx_append_token_(char *buf, size_t cap, uint8_t poll, bool ours) {
+  const size_t used = strlen(buf);
+  if (used + 6 >= cap)
+    return;
+  snprintf(buf + used, cap - used, "%s%02X%s", used != 0 ? " " : "", poll, ours ? "*" : "");
+}
+
+void NemtekComponent::tx_record_poll_(uint8_t poll) {
+  if (this->tx_base_left_ > 0) {
+    tx_append_token_(this->tx_base_text_, sizeof(this->tx_base_text_), poll, poll == this->tx_slot_);
+    if (--this->tx_base_left_ == 0)
+      ESP_LOGI(TAG_TX, "TX baseline polls: %s", this->tx_base_text_);
   }
-  if (this->tx_watch_until_ms_ != 0 && poll == this->tx_slot_ &&
-      static_cast<int32_t>(millis() - this->tx_watch_until_ms_) < 0) {
-    ESP_LOGI(TAG_TX, "TX ack repoll slot=%02X", poll);
-    this->tx_watch_until_ms_ = 0;
+  if (this->tx_post_left_ > 0) {
+    tx_append_token_(this->tx_post_text_, sizeof(this->tx_post_text_), poll, poll == this->tx_slot_);
+    if (--this->tx_post_left_ == 0)
+      ESP_LOGI(TAG_TX, "TX post-send polls slot=%02X: %s", this->tx_slot_, this->tx_post_text_);
+  }
+}
+
+void NemtekComponent::tx_on_poll_(uint8_t poll, uint32_t now_us) {
+  if (this->tx_lone_poll_(poll)) {
+    this->tx_record_poll_(poll);
+    if (this->tx_watch_until_ms_ != 0 && poll == this->tx_slot_ &&
+        static_cast<int32_t>(millis() - this->tx_watch_until_ms_) < 0) {
+      ESP_LOGI(TAG_TX, "TX ack repoll slot=%02X", poll);
+      this->tx_watch_until_ms_ = 0;
+    }
   }
   if (!this->tx_runtime_ || this->tx_fault_ || poll == 0x4F || poll != this->tx_slot_)
     return;
@@ -599,15 +621,32 @@ bool NemtekComponent::tx_send_(const uint8_t *bytes, uint8_t len, const char *wh
            static_cast<unsigned long>(latency / 1000), static_cast<unsigned long>((latency % 1000) / 100),
            static_cast<unsigned>(s_level_before));
   this->tx_watch_until_ms_ = millis() + 3000;
-  this->tx_post_left_ = 10;
-  this->tx_post_n_ = 0;
-  this->tx_post_pattern_[0] = '\0';
+  this->tx_post_left_ = 14;
+  this->tx_post_text_[0] = '\0';
   s_busy = 0;
   return true;
 #endif
 }
 
 void NemtekComponent::tx_service_(uint32_t now_us) {
+#ifdef USE_ESP32
+  if (this->tx_extra_pending_ && static_cast<int32_t>(now_us - (this->tx_extra_stop_us_ + 16000)) >= 0) {
+    int total = 0;
+    const uint16_t wr = s_ew;
+    for (int i = 0; i < kTxRing; i++) {
+      const uint16_t idx = static_cast<uint16_t>((wr + kTxRing - 1 - i) % kTxRing);
+      const int32_t dt = static_cast<int32_t>(s_et[idx] - this->tx_extra_stop_us_);
+      if (dt > 0 && dt <= 16000)
+        total++;
+    }
+    const bool reply = total >= 4;
+    ESP_LOGW(TAG_TX,
+             "TX slot %02X after stop: first %+ldus, edges to +16ms=%d (%s, not sending)", this->tx_extra_slot_,
+             static_cast<long>(this->tx_extra_dt_), total,
+             reply ? "looks like a reply from another device" : "one transition, panel release");
+    this->tx_extra_pending_ = false;
+  }
+#endif
   if (this->tx_uart_pending_) {
     const int32_t rel = static_cast<int32_t>(this->tx_edge_sched_us_ - this->tx_uart_pending_us_);
     // The edge schedule is often tens of ms away from the UART read. One slot
@@ -838,6 +877,12 @@ void NemtekComponent::tx_fire_(uint32_t stop_us) {
   if (!quiet && !lone_turnaround) {
     s_reply_pending = 0;
     this->tx_note_skip_(latency, "activity after stop", detail, true);
+    // Look again at +16 ms. A keypad reply is many edges; a panel release is one rise.
+    this->tx_extra_pending_ = true;
+    this->tx_extra_stop_us_ = stop_us;
+    this->tx_extra_at_us_ = now;
+    this->tx_extra_slot_ = this->tx_slot_;
+    this->tx_extra_dt_ = n_edges > 0 ? hits[0].dt : 0;
     return;
   }
   s_level_before = static_cast<uint8_t>(level);
