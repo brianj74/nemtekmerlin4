@@ -152,8 +152,12 @@ static const char *reset_reason_name_(esp_reset_reason_t reason) {
 void NemtekComponent::setup() {
 #ifdef USE_ESP32
   const esp_reset_reason_t reason = esp_reset_reason();
+  this->reset_reason_ = reset_reason_name_(reason);
+  this->reset_reason_code_ = static_cast<int>(reason);
+  // setup() runs before the API logger is attached, so this line is also
+  // repeated from dump_config(), which is what a later log session shows.
   ESP_LOGW(TAG, "Reset reason: %s (%d). Panic and watchdog backtraces are printed on the USB log before reboot.",
-           reset_reason_name_(reason), static_cast<int>(reason));
+           this->reset_reason_, this->reset_reason_code_);
 #endif
   ESP_LOGI(TAG, "Starting receive-only Nemtek Merlin 4 monitor");
   ESP_LOGI(TAG, "Capture logs can contain keypad PIN digits. Keep them private.");
@@ -1043,6 +1047,8 @@ void NemtekComponent::flush_pending_repeats_(uint32_t now_ms) {
 
 void NemtekComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "Nemtek Merlin 4 energiser monitor:");
+  ESP_LOGCONFIG(TAG, "  Reset reason: %s (%d)", this->reset_reason_, this->reset_reason_code_);
+  ESP_LOGI(TAG, "Reset reason: %s (%d)", this->reset_reason_, this->reset_reason_code_);
   ESP_LOGCONFIG(TAG, "  Direction: receive");
   ESP_LOGCONFIG(TAG, "  Protocol: legacy keypad bus, inverted UART, 2400 baud, 8 data, parity %s",
                 this->uart_parity_name_());

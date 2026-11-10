@@ -488,19 +488,11 @@ void NemtekComponent::tx_on_poll_(uint8_t poll, uint32_t now_us) {
   if (!this->tx_runtime_ || this->tx_fault_ || poll == 0x4F || poll != this->tx_slot_)
     return;
   this->tx_slot_seen_++;
-  // The edge timer owns the reply. This UART read is late; only explain a miss.
-  if (static_cast<int32_t>(now_us - this->tx_edge_sched_us_) < 20000)
-    return;
-  if (this->tx_want_()) {
-    // Do not report the gap since the previous poll as a stop-bit latency.
-    // That gap is one 7-poll cycle (~0.8-1.1 s) and is not a reply time.
-    if (this->burst_len_ > 1 && this->burst_[0] == 0x80)
-      this->tx_note_skip_(0, "glued to status");
-    else if (this->tx_edge_sched_us_ == 0)
-      this->tx_note_skip_(0, "slot on uart, no stop edge");
-    else
-      this->tx_note_skip_(static_cast<uint32_t>(now_us - this->tx_edge_sched_us_), "uart late vs stop edge");
-  }
+  // The UART byte often arrives before the edge timer has scheduled this same
+  // poll. Remember it and only log if the edge path does not take the poll.
+  this->tx_uart_pending_ = true;
+  this->tx_uart_pending_us_ = now_us;
+  this->tx_uart_pending_glued_ = this->burst_len_ > 1 && this->burst_[0] == 0x80;
   this->tx_poll_us_ = now_us;
 }
 
@@ -594,7 +586,23 @@ bool NemtekComponent::tx_send_(const uint8_t *bytes, uint8_t len, const char *wh
 }
 
 void NemtekComponent::tx_service_(uint32_t now_us) {
-  (void) now_us;
+  if (this->tx_uart_pending_) {
+    const int32_t rel = static_cast<int32_t>(this->tx_edge_sched_us_ - this->tx_uart_pending_us_);
+    const bool edge_took_it = this->tx_edge_sched_us_ != 0 && rel > -20000 && rel < 40000;
+    if (edge_took_it) {
+      this->tx_uart_pending_ = false;
+    } else if (static_cast<int32_t>(now_us - this->tx_uart_pending_us_) >= 40000) {
+      if (this->tx_want_()) {
+        if (this->tx_uart_pending_glued_)
+          this->tx_note_skip_(0, "glued to status");
+        else if (this->tx_edge_sched_us_ == 0)
+          this->tx_note_skip_(0, "slot on uart, no stop edge");
+        else
+          this->tx_note_skip_(static_cast<uint32_t>(now_us - this->tx_edge_sched_us_), "uart late vs stop edge");
+      }
+      this->tx_uart_pending_ = false;
+    }
+  }
   this->tx_flush_skips_(millis());
   if (this->awaiting_confirm_ && static_cast<int32_t>(millis() - this->confirm_deadline_ms_) >= 0) {
     const bool on = this->current_state_ == MerlinState::NORMAL || this->current_state_ == MerlinState::LOW_POWER ||
@@ -690,11 +698,13 @@ static void schedule_reply_(uint32_t stop_us, uint32_t delay_us) {
   }
 }
 
-static void describe_edges_(char *buf, size_t n, uint32_t stop_us, uint32_t now, int level, int *since_out) {
+static void describe_edges_(char *buf, size_t n, uint32_t stop_us, uint32_t now, int level, uint32_t turn_min,
+                            uint32_t turn_max, int *since_out, int *outside_out) {
   uint32_t times[6];
   uint8_t levels[6];
   int kept = 0;
   int since = 0;
+  int outside = 0;
   const uint16_t wr = s_ew;
   for (int i = 0; i < kTxRing; i++) {
     const uint16_t idx = static_cast<uint16_t>((wr + kTxRing - 1 - i) % kTxRing);
@@ -704,6 +714,9 @@ static void describe_edges_(char *buf, size_t n, uint32_t stop_us, uint32_t now,
     if (static_cast<int32_t>(et - now) > 0)
       continue;
     since++;
+    const uint32_t dt = et - stop_us;
+    if (dt < turn_min || dt > turn_max)
+      outside++;
     if (kept < 6) {
       int j = kept;
       while (j > 0 && static_cast<int32_t>(times[j - 1] - et) > 0) {
@@ -717,6 +730,7 @@ static void describe_edges_(char *buf, size_t n, uint32_t stop_us, uint32_t now,
     }
   }
   *since_out = since;
+  *outside_out = outside;
   int pos = snprintf(buf, n, "level=%d edges-since-stop=%d", level, since);
   for (int i = 0; i < kept && pos > 0 && static_cast<size_t>(pos) < n; i++) {
     const int32_t dt = static_cast<int32_t>(times[i] - stop_us);
@@ -753,22 +767,16 @@ void NemtekComponent::tx_fire_(uint32_t stop_us) {
   const int level = this->edge_pin_ >= 0 ? gpio_get_level(pin) : 1;
   char detail[140];
   int since = 0;
-  describe_edges_(detail, sizeof(detail), stop_us, now, level, &since);
-  // Several edges after the stop bit mean a byte is still moving. A steady
-  // level, including low, is inverted idle or the panel not having released
-  // yet. Low by itself is not a collision: panel idle is pad LOW.
-  if (since >= 2 || (since == 1 && level == 0)) {
+  int outside = 0;
+  describe_edges_(detail, sizeof(detail), stop_us, now, level, this->tx_turnaround_min_us_,
+                  this->tx_turnaround_max_us_, &since, &outside);
+  // One edge inside the turnaround window is the panel returning to inverted
+  // idle (~2 bit times after the computed stop). The pad then stays low, and
+  // that is the level a keypad reply starts from. Any other edge is activity.
+  const bool collision = outside > 0 || since > 1;
+  if (collision) {
     s_reply_pending = 0;
     this->tx_note_skip_(latency, "activity after stop", detail, true);
-    return;
-  }
-  if (level == 0) {
-    if (latency + 250 < this->tx_reply_max_us_) {
-      schedule_reply_(stop_us, 250);
-      return;
-    }
-    s_reply_pending = 0;
-    this->tx_note_skip_(latency, "still low at window end", detail, true);
     return;
   }
   s_level_before = static_cast<uint8_t>(level);

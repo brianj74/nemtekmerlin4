@@ -138,6 +138,8 @@ class NemtekComponent : public Component, public uart::UARTDevice {
   void set_tx_reply_us(uint32_t us) { this->tx_reply_us_ = us; }
   void set_tx_reply_min_us(uint32_t us) { this->tx_reply_min_us_ = us; }
   void set_tx_reply_max_us(uint32_t us) { this->tx_reply_max_us_ = us; }
+  void set_tx_turnaround_min_us(uint32_t us) { this->tx_turnaround_min_us_ = us; }
+  void set_tx_turnaround_max_us(uint32_t us) { this->tx_turnaround_max_us_ = us; }
   void set_fence_pin(const char *pin);
 
   void set_capture_switch(NemtekCaptureSwitch *capture_switch) { this->capture_switch_ = capture_switch; }
@@ -371,6 +373,13 @@ class NemtekComponent : public Component, public uart::UARTDevice {
   uint32_t tx_reply_us_{2900};
   uint32_t tx_reply_min_us_{2500};
   uint32_t tx_reply_max_us_{5000};
+  uint32_t tx_turnaround_min_us_{600};
+  uint32_t tx_turnaround_max_us_{1100};
+  bool tx_uart_pending_{false};
+  bool tx_uart_pending_glued_{false};
+  uint32_t tx_uart_pending_us_{0};
+  const char *reset_reason_{"unknown"};
+  int reset_reason_code_{-1};
   uint32_t tx_stop_us_{0};
   const char *tx_skip_why_{nullptr};
   uint32_t tx_skip_n_{0};
