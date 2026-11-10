@@ -475,11 +475,29 @@ void NemtekComponent::tx_flush_skips_(uint32_t now_ms) {
   }
   if (this->tx_runtime_ && this->tx_want_() && this->tx_slot_seen_ == 0)
     ESP_LOGW(TAG_TX, "TX wait: slot %02X not seen", this->tx_slot_);
+  if (this->tx_glue_n_ > 0) {
+    ESP_LOGI(TAG_TX, "TX uart slot=%02X inside status burst x%lu gap %lums-%lums (edge path still owns the reply)",
+             this->tx_slot_, static_cast<unsigned long>(this->tx_glue_n_),
+             static_cast<unsigned long>(this->tx_glue_min_us_ / 1000),
+             static_cast<unsigned long>(this->tx_glue_max_us_ / 1000));
+    this->tx_glue_n_ = 0;
+    this->tx_glue_min_us_ = 0;
+    this->tx_glue_max_us_ = 0;
+  }
   this->tx_slot_seen_ = 0;
   this->tx_stat_ms_ = now_ms;
 }
 
 void NemtekComponent::tx_on_poll_(uint8_t poll, uint32_t now_us) {
+  if (this->tx_post_left_ > 0 && this->tx_post_n_ < 10) {
+    this->tx_post_pattern_[this->tx_post_n_++] = poll == this->tx_slot_ ? '1' : '0';
+    this->tx_post_left_--;
+    if (this->tx_post_left_ == 0) {
+      this->tx_post_pattern_[this->tx_post_n_] = '\0';
+      ESP_LOGI(TAG_TX, "TX post-send polls slot=%02X: %s (1 = our slot; a normal cycle has one 1 per 7 polls)",
+               this->tx_slot_, this->tx_post_pattern_);
+    }
+  }
   if (this->tx_watch_until_ms_ != 0 && poll == this->tx_slot_ &&
       static_cast<int32_t>(millis() - this->tx_watch_until_ms_) < 0) {
     ESP_LOGI(TAG_TX, "TX ack repoll slot=%02X", poll);
@@ -493,6 +511,7 @@ void NemtekComponent::tx_on_poll_(uint8_t poll, uint32_t now_us) {
   this->tx_uart_pending_ = true;
   this->tx_uart_pending_us_ = now_us;
   this->tx_uart_pending_glued_ = this->burst_len_ > 1 && this->burst_[0] == 0x80;
+  this->tx_uart_gap_us_ = (this->burst_len_ > 1) ? this->delta_us_[this->burst_len_ - 1] : 0;
   this->tx_poll_us_ = now_us;
 }
 
@@ -580,6 +599,9 @@ bool NemtekComponent::tx_send_(const uint8_t *bytes, uint8_t len, const char *wh
            static_cast<unsigned long>(latency / 1000), static_cast<unsigned long>((latency % 1000) / 100),
            static_cast<unsigned>(s_level_before));
   this->tx_watch_until_ms_ = millis() + 3000;
+  this->tx_post_left_ = 10;
+  this->tx_post_n_ = 0;
+  this->tx_post_pattern_[0] = '\0';
   s_busy = 0;
   return true;
 #endif
@@ -588,13 +610,23 @@ bool NemtekComponent::tx_send_(const uint8_t *bytes, uint8_t len, const char *wh
 void NemtekComponent::tx_service_(uint32_t now_us) {
   if (this->tx_uart_pending_) {
     const int32_t rel = static_cast<int32_t>(this->tx_edge_sched_us_ - this->tx_uart_pending_us_);
-    const bool edge_took_it = this->tx_edge_sched_us_ != 0 && rel > -20000 && rel < 40000;
+    // The edge schedule is often tens of ms away from the UART read. One slot
+    // period is ~1 s, so ±250 ms still names this poll and not the previous one.
+    const bool edge_took_it = this->tx_edge_sched_us_ != 0 && rel > -250000 && rel < 250000;
     if (edge_took_it) {
+      if (this->tx_uart_pending_glued_) {
+        const uint32_t gap = this->tx_uart_gap_us_;
+        if (this->tx_glue_n_ == 0 || gap < this->tx_glue_min_us_)
+          this->tx_glue_min_us_ = gap;
+        if (gap > this->tx_glue_max_us_)
+          this->tx_glue_max_us_ = gap;
+        this->tx_glue_n_++;
+      }
       this->tx_uart_pending_ = false;
-    } else if (static_cast<int32_t>(now_us - this->tx_uart_pending_us_) >= 40000) {
+    } else if (static_cast<int32_t>(now_us - this->tx_uart_pending_us_) >= 250000) {
       if (this->tx_want_()) {
         if (this->tx_uart_pending_glued_)
-          this->tx_note_skip_(0, "glued to status");
+          this->tx_note_skip_(this->tx_uart_gap_us_, "glued to status, edge missed");
         else if (this->tx_edge_sched_us_ == 0)
           this->tx_note_skip_(0, "slot on uart, no stop edge");
         else
@@ -673,6 +705,20 @@ void NemtekComponent::tx_on_edge_byte_(uint32_t start_us) {
   const uint32_t stop_us = start_us + (11ULL * 1000000ULL) / 2400ULL;
   this->tx_stop_us_ = stop_us;
   this->tx_edge_sched_us_ = micros();
+  if (this->tx_uart_pending_) {
+    const int32_t rel = static_cast<int32_t>(this->tx_edge_sched_us_ - this->tx_uart_pending_us_);
+    if (rel > -250000 && rel < 250000) {
+      if (this->tx_uart_pending_glued_) {
+        const uint32_t gap = this->tx_uart_gap_us_;
+        if (this->tx_glue_n_ == 0 || gap < this->tx_glue_min_us_)
+          this->tx_glue_min_us_ = gap;
+        if (gap > this->tx_glue_max_us_)
+          this->tx_glue_max_us_ = gap;
+        this->tx_glue_n_++;
+      }
+      this->tx_uart_pending_ = false;
+    }
+  }
   const int32_t wait = static_cast<int32_t>((stop_us + this->tx_reply_us_) - micros());
   if (wait > static_cast<int32_t>(this->tx_reply_max_us_)) {
     this->tx_note_skip_(static_cast<uint32_t>(wait), "stop edge already outside window");
@@ -698,45 +744,43 @@ static void schedule_reply_(uint32_t stop_us, uint32_t delay_us) {
   }
 }
 
-static void describe_edges_(char *buf, size_t n, uint32_t stop_us, uint32_t now, int level, uint32_t turn_min,
-                            uint32_t turn_max, int *since_out, int *outside_out) {
-  uint32_t times[6];
-  uint8_t levels[6];
-  int kept = 0;
-  int since = 0;
-  int outside = 0;
+struct TxEdgeHit {
+  int32_t dt;
+  uint8_t level;
+};
+
+// One list is both the log line and the gate. A lone edge whose dt is inside
+// [turn_min, turn_max] is the panel turnaround, for idle and for a key.
+static int collect_edges_(TxEdgeHit *hits, int cap, uint32_t stop_us, uint32_t now, int *stored_out) {
+  int total = 0;
+  int stored = 0;
   const uint16_t wr = s_ew;
   for (int i = 0; i < kTxRing; i++) {
     const uint16_t idx = static_cast<uint16_t>((wr + kTxRing - 1 - i) % kTxRing);
     const uint32_t et = s_et[idx];
-    if (static_cast<int32_t>(et - stop_us) <= 0)
+    const int32_t dt = static_cast<int32_t>(et - stop_us);
+    if (dt <= 0)
       continue;
     if (static_cast<int32_t>(et - now) > 0)
       continue;
-    since++;
-    const uint32_t dt = et - stop_us;
-    if (dt < turn_min || dt > turn_max)
-      outside++;
-    if (kept < 6) {
-      int j = kept;
-      while (j > 0 && static_cast<int32_t>(times[j - 1] - et) > 0) {
-        times[j] = times[j - 1];
-        levels[j] = levels[j - 1];
-        j--;
-      }
-      times[j] = et;
-      levels[j] = s_el[idx];
-      kept++;
+    total++;
+    if (stored >= cap)
+      continue;
+    int j = stored;
+    while (j > 0 && hits[j - 1].dt > dt) {
+      hits[j] = hits[j - 1];
+      j--;
     }
+    hits[j].dt = dt;
+    hits[j].level = s_el[idx];
+    stored++;
   }
-  *since_out = since;
-  *outside_out = outside;
-  int pos = snprintf(buf, n, "level=%d edges-since-stop=%d", level, since);
-  for (int i = 0; i < kept && pos > 0 && static_cast<size_t>(pos) < n; i++) {
-    const int32_t dt = static_cast<int32_t>(times[i] - stop_us);
-    pos += snprintf(buf + pos, n - static_cast<size_t>(pos), " %+ldus/%u", static_cast<long>(dt),
-                    static_cast<unsigned>(levels[i]));
-  }
+  *stored_out = stored;
+  return total;
+}
+
+static bool edge_in_turnaround_(int32_t dt, uint32_t turn_min, uint32_t turn_max) {
+  return dt >= static_cast<int32_t>(turn_min) && dt <= static_cast<int32_t>(turn_max);
 }
 #endif
 
@@ -765,22 +809,41 @@ void NemtekComponent::tx_fire_(uint32_t stop_us) {
 #ifdef USE_ESP32
   const gpio_num_t pin = static_cast<gpio_num_t>(this->edge_pin_);
   const int level = this->edge_pin_ >= 0 ? gpio_get_level(pin) : 1;
-  char detail[140];
-  int since = 0;
-  int outside = 0;
-  describe_edges_(detail, sizeof(detail), stop_us, now, level, this->tx_turnaround_min_us_,
-                  this->tx_turnaround_max_us_, &since, &outside);
-  // One edge inside the turnaround window is the panel returning to inverted
-  // idle (~2 bit times after the computed stop). The pad then stays low, and
-  // that is the level a keypad reply starts from. Any other edge is activity.
-  const bool collision = outside > 0 || since > 1;
-  if (collision) {
+  uint32_t turn_min = this->tx_turnaround_min_us_;
+  uint32_t turn_max = this->tx_turnaround_max_us_;
+  if (turn_max < turn_min || (turn_min == 0 && turn_max == 0)) {
+    turn_min = 600;
+    turn_max = 1100;
+  }
+  TxEdgeHit hits[8];
+  int stored = 0;
+  const int n_edges = collect_edges_(hits, 8, stop_us, now, &stored);
+  int outside = n_edges - stored;
+  for (int i = 0; i < stored; i++) {
+    if (!edge_in_turnaround_(hits[i].dt, turn_min, turn_max))
+      outside++;
+  }
+  char detail[180];
+  int pos = snprintf(detail, sizeof(detail), "level=%d edges=%d outside=%d window=%lu-%lu", level, n_edges, outside,
+                     static_cast<unsigned long>(turn_min), static_cast<unsigned long>(turn_max));
+  for (int i = 0; i < stored && pos > 0 && static_cast<size_t>(pos) < sizeof(detail); i++) {
+    pos += snprintf(detail + pos, sizeof(detail) - static_cast<size_t>(pos), " %+ldus->%u",
+                    static_cast<long>(hits[i].dt), static_cast<unsigned>(hits[i].level));
+  }
+  // Idle, digit, and fence all use this one decision. A single edge inside
+  // the window is the panel falling back to idle low. The keypad reply
+  // starts from that low.
+  const bool lone_turnaround = n_edges == 1 && outside == 0;
+  const bool quiet = n_edges == 0;
+  if (!quiet && !lone_turnaround) {
     s_reply_pending = 0;
     this->tx_note_skip_(latency, "activity after stop", detail, true);
     return;
   }
   s_level_before = static_cast<uint8_t>(level);
   s_reply_pending = 0;
+  const char *kind = this->key_q_len_ > 0 ? "key" : "idle";
+  ESP_LOGI(TAG_TX, "TX gate pass %s %s", kind, detail);
 #endif
   this->tx_stop_us_ = stop_us;
   uint8_t frame[3] = {0xFE, 0x04, 0x03};

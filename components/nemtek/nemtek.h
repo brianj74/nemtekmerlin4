@@ -388,6 +388,13 @@ class NemtekComponent : public Component, public uart::UARTDevice {
   uint32_t tx_slot_seen_{0};
   uint32_t tx_stat_ms_{0};
   uint32_t tx_edge_sched_us_{0};
+  uint32_t tx_uart_gap_us_{0};
+  uint32_t tx_glue_n_{0};
+  uint32_t tx_glue_min_us_{0};
+  uint32_t tx_glue_max_us_{0};
+  char tx_post_pattern_[12]{};
+  uint8_t tx_post_left_{0};
+  uint8_t tx_post_n_{0};
   uint32_t attempt_ms_[3]{};
   uint8_t attempt_n_{0};
   char tx_line_pin_{0};

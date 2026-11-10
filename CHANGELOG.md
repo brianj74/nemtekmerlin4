@@ -8,6 +8,7 @@
 - A queued reply is started from that stop-bit time by a one-shot timer, inside a 2.5–5.0 ms window (`tx_reply`, `tx_reply_min`, `tx_reply_max`). Misses are summarised every 5 s (`TX skip xN`, `TX wait: slot XX not seen`) instead of being dropped silently.
 - A steady low pad is panel idle, not a collision. The pull-up is re-applied, the pin stays an input until the reply, and the open-drain drive is GPIO-low = DAT-low through the MOSFET shifter. Skip lines include the raw level and recent edges. The boot log names the reset reason.
 - The single falling edge about 0.8 ms after the stop bit is the panel turnaround (`tx_turnaround_min` / `tx_turnaround_max`, default 600–1100 µs) and is not a collision. The reply is sent from that low idle. `Reset reason` is repeated in the boot dump. A UART "glued to status" note is kept only when the edge path did not already take that poll.
+- Idle, digit, and fence sends share one gate. The skip line prints the window and `outside` count next to the same edge it judged. After a send, the next 10 polls are logged as `TX post-send polls slot=79: 0000001000`. A poll that merely shares the status burst is counted, not treated as a missed send.
 
 ## 0.2.2 — 2026-11-09
 
